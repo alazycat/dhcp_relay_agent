@@ -1,3 +1,5 @@
+#![cfg(feature = "dhcpv6")]
+
 //! Integration test: DHCPv6 Relay-forward/Relay-reply full round-trip.
 //!
 //! Simulates: SOLICIT → RELAY_FORW (with Interface-ID, Remote-ID) → ADVERTISE → RELAY_REPL.

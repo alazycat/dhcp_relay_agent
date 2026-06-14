@@ -1,3 +1,5 @@
+#![cfg(feature = "smf")]
+
 //! Integration test: SMF DPD duplicate detection and TTL attack protection.
 
 use std::net::{IpAddr, Ipv4Addr};

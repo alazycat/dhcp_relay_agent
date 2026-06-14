@@ -1,6 +1,7 @@
 pub mod config;
 pub mod error;
 pub mod pipeline;
+pub mod traits;
 pub mod transport;
 
 #[cfg(feature = "dhcpv4")]

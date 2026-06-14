@@ -1,6 +1,6 @@
 [package]
 name = "dhcp-relay-agent"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "DHCP Relay Agent library implementing RFC 3046, RFC 6607, and RFC 6621"
 repository = "https://github.com/alazycat/dhcp_relay_agent"

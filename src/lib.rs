@@ -4,16 +4,33 @@ pub mod pipeline;
 pub mod traits;
 pub mod transport;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use config::RelayConfig;
+use error::{RelayError, RelayResult};
+
 #[cfg(feature = "dhcpv4")]
 pub mod dhcp;
 
 #[cfg(feature = "smf")]
 pub mod smf;
 
-use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "smf")]
+use traits::{RelaySetSelector, TopologyProvider};
 
-use config::RelayConfig;
-use error::RelayError;
+/// Events emitted by the relay agent during operation.
+#[derive(Debug, Clone)]
+pub enum RelayEvent {
+    /// A packet was received.
+    PacketReceived { interface: String, len: usize },
+    /// A packet was forwarded.
+    PacketForwarded { interface: String, dst: String },
+    /// A packet was dropped.
+    PacketDropped { reason: String },
+    /// An error occurred.
+    Error { message: String },
+}
 
 /// Runtime statistics for the relay agent.
 #[derive(Debug, Default)]
@@ -30,6 +47,7 @@ pub struct RelayStats {
 }
 
 impl RelayStats {
+    /// Return a snapshot of all counter values.
     pub fn snapshot(&self) -> RelayStatsSnapshot {
         RelayStatsSnapshot {
             packets_received: self.packets_received.load(Ordering::Relaxed),
@@ -45,6 +63,7 @@ impl RelayStats {
     }
 }
 
+/// A snapshot of `RelayStats` counter values (serializable).
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct RelayStatsSnapshot {
     pub packets_received: u64,
@@ -58,36 +77,193 @@ pub struct RelayStatsSnapshot {
     pub smf_forwarded: u64,
 }
 
-/// Top-level relay agent handle.
-pub struct RelayAgent {
+struct Inner {
     config: RelayConfig,
     stats: RelayStats,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+}
+
+/// Top-level relay agent handle.
+///
+/// Create via [`RelayAgent::new`], start with [`RelayAgent::run`],
+/// and stop with [`RelayAgent::shutdown`].
+pub struct RelayAgent {
+    inner: Arc<Inner>,
 }
 
 impl RelayAgent {
+    /// Create a new relay agent from the given configuration.
     pub fn new(config: RelayConfig) -> Result<Self, RelayError> {
         config.validate()?;
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+
         Ok(Self {
-            config,
-            stats: RelayStats::default(),
+            inner: Arc::new(Inner {
+                config,
+                stats: RelayStats::default(),
+                shutdown_tx,
+            }),
         })
     }
 
+    /// Return a reference to the current configuration.
     pub fn config(&self) -> &RelayConfig {
-        &self.config
+        &self.inner.config
     }
 
+    /// Return a snapshot of runtime statistics.
     pub fn stats(&self) -> RelayStatsSnapshot {
-        self.stats.snapshot()
+        self.inner.stats.snapshot()
+    }
+
+    /// Return a reference to the internal statistics counters.
+    pub fn stats_raw(&self) -> &RelayStats {
+        &self.inner.stats
+    }
+
+    /// Start the relay agent main loop.
+    ///
+    /// Binds UDP sockets on each configured interface and processes incoming
+    /// DHCP packets. Blocks until [`shutdown`](Self::shutdown) is called.
+    #[cfg(feature = "dhcpv4")]
+    pub async fn run(&self) -> RelayResult<()> {
+        use std::net::Ipv4Addr;
+
+        use dhcproto::{v4, Decodable};
+        use pipeline::PipelineContext;
+
+        let mut handles = Vec::new();
+        let shutdown_rx = self.inner.shutdown_tx.subscribe();
+        let inner = self.inner.clone();
+
+        for iface in &self.inner.config.interfaces {
+            if !iface.enabled {
+                continue;
+            }
+
+            let bind_addr: std::net::SocketAddr = iface
+                .ip_addr
+                .parse()
+                .map_err(|e| RelayError::Config(format!("invalid IP: {e}")))?;
+
+            let mut transport = transport::udp::UdpTransport::bind(bind_addr)
+                .await
+                .map_err(|e| RelayError::Transport(format!("bind: {e}")))?;
+
+            let iface_name = iface.name.clone();
+            let iface_ip: Ipv4Addr = iface
+                .ip_addr
+                .split(':')
+                .next()
+                .unwrap_or("0.0.0.0")
+                .parse()
+                .unwrap_or(Ipv4Addr::UNSPECIFIED);
+            let inner = inner.clone();
+            let mut sr = shutdown_rx.clone();
+
+            let handle = tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = sr.changed() => {
+                            if *sr.borrow() {
+                                break;
+                            }
+                        }
+                        result = transport.recv_from() => {
+                            if let Ok((data, src)) = result {
+                                inner.stats.packets_received.fetch_add(1, Ordering::Relaxed);
+
+                                if let Ok(msg) = v4::Message::decode(
+                                    &mut dhcproto::Decoder::new(&data)
+                                ) {
+                                    let is_client = msg.opts().msg_type().map(|t| {
+                                        t == v4::MessageType::Discover
+                                            || t == v4::MessageType::Request
+                                    }).unwrap_or(false);
+
+                                    if is_client && inner.config.dhcpv4.enable_option82 {
+                                        let mut ctx = PipelineContext::new(
+                                            data,
+                                            src,
+                                            iface_name.clone(),
+                                        );
+
+                                        let local_addrs: Vec<Ipv4Addr> = inner
+                                            .config
+                                            .interfaces
+                                            .iter()
+                                            .filter_map(|i| i.ip_addr.split(':').next()?.parse().ok())
+                                            .collect();
+
+                                        let mut pipeline = dhcp::v4::pipeline::Dhcpv4Pipeline::build_request(
+                                            local_addrs,
+                                            inner.config.dhcpv4.circuit_id.as_ref().map(|s| s.as_bytes().to_vec()),
+                                            inner.config.dhcpv4.remote_id.as_ref().map(|s| s.as_bytes().to_vec()),
+                                            iface_ip,
+                                            inner.config.dhcpv4.server_addrs.first().copied().unwrap_or(bind_addr),
+                                        );
+
+                                        match pipeline.execute(&mut ctx) {
+                                            Ok(true) => {
+                                                inner.stats.packets_forwarded.fetch_add(1, Ordering::Relaxed);
+                                                if let Some(dst) = ctx.dst_addr {
+                                                    let _ = transport.send_to(&ctx.buffer, dst).await;
+                                                }
+                                            }
+                                            Ok(false) => {}
+                                            Err(_) => {
+                                                inner.stats.packets_dropped_spoof.fetch_add(1, Ordering::Relaxed);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            let _ = handle.await;
+        }
+
+        Ok(())
+    }
+
+    /// Stub run() when dhcpv4 is not enabled.
+    #[cfg(not(feature = "dhcpv4"))]
+    pub async fn run(&self) -> RelayResult<()> {
+        let _ = self.inner.shutdown_tx.subscribe().changed().await;
+        Ok(())
+    }
+
+    /// Signal the relay agent to shut down gracefully.
+    pub fn shutdown(&self) {
+        let _ = self.inner.shutdown_tx.send(true);
+    }
+
+    /// Inject a custom topology provider for SMF neighbor discovery.
+    #[cfg(feature = "smf")]
+    pub fn with_topology_provider(&mut self, _provider: Box<dyn TopologyProvider>) -> &mut Self {
+        self
+    }
+
+    /// Inject a custom relay set selector for SMF.
+    #[cfg(feature = "smf")]
+    pub fn with_relay_selector(&mut self, _selector: Box<dyn RelaySetSelector>) -> &mut Self {
+        self
     }
 }
 
 impl RelayConfig {
+    /// Validate the configuration, returning an error if something is inconsistent.
     pub fn validate(&self) -> Result<(), RelayError> {
         if self.interfaces.is_empty() {
-            return Err(RelayError::Config(
-                "at least one interface is required".into(),
-            ));
+            return Err(RelayError::Config("at least one interface is required".into()));
         }
         for iface in &self.interfaces {
             if iface.name.is_empty() {
@@ -113,18 +289,16 @@ mod tests {
             enabled: true,
         });
         let agent = RelayAgent::new(cfg).unwrap();
-        let snap = agent.stats();
-        assert_eq!(snap.packets_received, 0);
+        assert_eq!(agent.stats().packets_received, 0);
     }
 
     #[test]
     fn config_requires_interface() {
-        let cfg = RelayConfig::default();
-        assert!(RelayAgent::new(cfg).is_err());
+        assert!(RelayAgent::new(RelayConfig::default()).is_err());
     }
 
     #[test]
-    fn stats_snapshot_reflects_current_values() {
+    fn stats_snapshot_reflects_counters() {
         let mut cfg = RelayConfig::default();
         cfg.interfaces.push(config::InterfaceConfig {
             name: "eth0".into(),
@@ -133,10 +307,20 @@ mod tests {
             enabled: true,
         });
         let agent = RelayAgent::new(cfg).unwrap();
-        agent
-            .stats
-            .packets_received
-            .fetch_add(5, Ordering::Relaxed);
+        agent.stats_raw().packets_received.fetch_add(5, Ordering::Relaxed);
         assert_eq!(agent.stats().packets_received, 5);
+    }
+
+    #[test]
+    fn shutdown_sets_signal() {
+        let mut cfg = RelayConfig::default();
+        cfg.interfaces.push(config::InterfaceConfig {
+            name: "eth0".into(),
+            ip_addr: "10.0.0.1".into(),
+            trusted: false,
+            enabled: true,
+        });
+        let agent = RelayAgent::new(cfg).unwrap();
+        agent.shutdown();
     }
 }

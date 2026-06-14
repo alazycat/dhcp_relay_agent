@@ -16,7 +16,7 @@ impl SubOption {
 }
 
 /// Convert dhcproto `RelayInfo` variants into our `SubOption`.
-fn relay_info_to_sub_opt(info: &relay::RelayInfo) -> SubOption {
+pub(crate) fn relay_info_to_sub_opt(info: &relay::RelayInfo) -> SubOption {
     match info {
         relay::RelayInfo::AgentCircuitId(data) => SubOption::new(1, data.clone()),
         relay::RelayInfo::AgentRemoteId(data) => SubOption::new(2, data.clone()),

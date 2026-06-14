@@ -1,2 +1,6 @@
 /target/
 .loop-state.json
+.claude/
+CLAUDE.md
+rfc*.txt
+tasks/

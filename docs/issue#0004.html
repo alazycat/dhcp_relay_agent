@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Implementation Notes — Issue #4</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #FAF9F6; color: #1a1a1a; padding: 2.5rem 2rem; line-height: 1.7; }
+    .container { max-width: 800px; margin: 0 auto; }
+    h1 { font-size: 1.375rem; font-weight: 700; margin-bottom: 0.25rem; }
+    .meta { color: #8B8680; font-size: 0.8125rem; margin-bottom: 2rem; }
+    h2 { font-size: 1rem; font-weight: 600; margin-top: 2rem; margin-bottom: 0.75rem; padding-bottom: 0.375rem; border-bottom: 1px solid #E8E4DE; display: flex; align-items: center; gap: 0.5rem; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+    .dot.design { background: #5B8A72; } .dot.deviation { background: #D97757; } .dot.tradeoff { background: #4A6FA5; } .dot.question { background: #D4A843; }
+    .item { background: #FFFFFF; border: 1px solid #E8E4DE; border-radius: 8px; padding: 1rem 1.25rem; margin-bottom: 0.75rem; box-shadow: 0 1px 3px rgba(0,0,0,0.03); }
+    .item h3 { font-size: 0.875rem; font-weight: 600; margin-bottom: 0.375rem; }
+    .item p { font-size: 0.8125rem; color: #4A4540; margin-bottom: 0.375rem; }
+    .label { display: inline-block; font-size: 0.6875rem; font-weight: 500; padding: 0.125rem 0.5rem; border-radius: 4px; margin-right: 0.375rem; }
+    .label-design { background: #F5F8F6; color: #5B8A72; border: 1px solid #5B8A72; }
+    .label-deviation { background: #FFF5F0; color: #D97757; border: 1px solid #D97757; }
+    .label-tradeoff { background: #F0F4F8; color: #4A6FA5; border: 1px solid #4A6FA5; }
+    .label-question { background: #FDF8F0; color: #D4A843; border: 1px solid #D4A843; }
+    .none { color: #B0AAA4; font-style: italic; font-size: 0.8125rem; }
+    .footer { text-align: center; margin-top: 2.5rem; color: #B0AAA4; font-size: 0.6875rem; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Implementation Notes</h1>
+    <p class="meta">Issue #4 &mdash; DHCPv6 Relay-forward/Relay-reply Codec &mdash; 2026-06-14</p>
+
+    <h2><span class="dot design"></span> Design Decisions</h2>
+    <div class="item">
+      <h3><span class="label label-design">Decision</span> Manual wire-format codec instead of dhcproto RelayMessage</h3>
+      <p><strong>Ambiguity:</strong> Whether to use dhcproto's RelayMessage or build our own codec.</p>
+      <p><strong>Choice:</strong> Implemented custom byte-level encode/decode for RELAY_FORW/RELAY_REPL messages.</p>
+      <p><strong>Rationale:</strong> dhcproto v0.14 RelayMessage has all-private fields with getters only — no constructor or setters. Cannot build one programmatically. The wire format is simple (34-byte header + TLV options) making a custom codec straightforward and dependency-light.</p>
+    </div>
+    <div class="item">
+      <h3><span class="label label-design">Decision</span> Recursive nested relay unwrapping</h3>
+      <p><strong>Ambiguity:</strong> How deep relay nesting can go.</p>
+      <p><strong>Choice:</strong> Recursive decapsulate() — if the extracted relay-message is itself RELAY_REPL, recurse.</p>
+      <p><strong>Rationale:</strong> RFC 3315 allows up to 32 hops. Recursion handles arbitrary depth cleanly. Stack overflow is not a concern at 32 max depth.</p>
+    </div>
+
+    <h2><span class="dot deviation"></span> Deviations</h2>
+    <div class="item">
+      <h3><span class="label label-deviation">Deviation</span> IPv4 peer address maps to :: (unspecified)</h3>
+      <p><strong>Spec said:</strong> peer-address is the client's source address.</p>
+      <p><strong>Implemented:</strong> If peer_addr is IPv4, sets peer-address to Ipv6Addr::UNSPECIFIED.</p>
+      <p><strong>Why:</strong> DHCPv6 relay messages always use IPv6 addresses. An IPv4 peer in a DHCPv6 context is a configuration error, but mapping to :: is safer than panicking.</p>
+    </div>
+
+    <h2><span class="dot tradeoff"></span> Tradeoffs</h2>
+    <div class="item">
+      <h3><span class="label label-tradeoff">Tradeoff</span> Manual codec vs forking dhcproto</h3>
+      <p><strong>Alternatives:</strong> (A) Fork dhcproto and add RelayMessage constructor/setters; (B) Build our own codec on the wire format.</p>
+      <p><strong>Chose B:</strong> 100 lines of straightforward code vs maintaining a fork of an external crate. If dhcproto adds proper constructors in a future version, we can migrate.</p>
+    </div>
+
+    <h2><span class="dot question"></span> Open Questions</h2>
+    <div class="item">
+      <h3><span class="label label-question">Question</span> Option handling in relay messages</h3>
+      <p>Issue #5 will add Interface-ID (18) and Remote-ID (37) options to the relay-forward message. The current codec only handles relay-message option (9). Option insertion/extraction APIs will need to be added or the codec extended to support generic option TLV handling in relay messages.</p>
+    </div>
+
+    <p class="footer">Generated by goal-workflow /note-it</p>
+  </div>
+</body>
+</html>

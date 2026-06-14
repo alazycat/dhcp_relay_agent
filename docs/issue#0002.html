@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Implementation Notes — Issue #2</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #FAF9F6; color: #1a1a1a; padding: 2.5rem 2rem; line-height: 1.7; }
+    .container { max-width: 800px; margin: 0 auto; }
+    h1 { font-size: 1.375rem; font-weight: 700; margin-bottom: 0.25rem; }
+    .meta { color: #8B8680; font-size: 0.8125rem; margin-bottom: 2rem; }
+    h2 { font-size: 1rem; font-weight: 600; margin-top: 2rem; margin-bottom: 0.75rem; padding-bottom: 0.375rem; border-bottom: 1px solid #E8E4DE; display: flex; align-items: center; gap: 0.5rem; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+    .dot.design { background: #5B8A72; } .dot.deviation { background: #D97757; } .dot.tradeoff { background: #4A6FA5; } .dot.question { background: #D4A843; }
+    .item { background: #FFFFFF; border: 1px solid #E8E4DE; border-radius: 8px; padding: 1rem 1.25rem; margin-bottom: 0.75rem; box-shadow: 0 1px 3px rgba(0,0,0,0.03); }
+    .item h3 { font-size: 0.875rem; font-weight: 600; margin-bottom: 0.375rem; }
+    .item p { font-size: 0.8125rem; color: #4A4540; margin-bottom: 0.375rem; }
+    .label { display: inline-block; font-size: 0.6875rem; font-weight: 500; padding: 0.125rem 0.5rem; border-radius: 4px; margin-right: 0.375rem; }
+    .label-design { background: #F5F8F6; color: #5B8A72; border: 1px solid #5B8A72; }
+    .label-deviation { background: #FFF5F0; color: #D97757; border: 1px solid #D97757; }
+    .label-tradeoff { background: #F0F4F8; color: #4A6FA5; border: 1px solid #4A6FA5; }
+    .label-question { background: #FDF8F0; color: #D4A843; border: 1px solid #D4A843; }
+    .none { color: #B0AAA4; font-style: italic; font-size: 0.8125rem; }
+    .footer { text-align: center; margin-top: 2.5rem; color: #B0AAA4; font-size: 0.6875rem; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Implementation Notes</h1>
+    <p class="meta">Issue #2 &mdash; DHCPv4 Option 82 Processing (RFC 3046) &mdash; 2026-06-14</p>
+
+    <h2><span class="dot design"></span> Design Decisions</h2>
+    <div class="item">
+      <h3><span class="label label-design">Decision</span> Own SubOption type instead of exposing dhcproto RelayInfo directly</h3>
+      <p><strong>Ambiguity:</strong> Whether to use dhcproto's <code>RelayInfo</code> enum as the public API type.</p>
+      <p><strong>Choice:</strong> Defined a simple <code>SubOption { code: u8, data: Vec&lt;u8&gt; }</code> struct for the relay agent's public surface.</p>
+      <p><strong>Rationale:</strong> Decouples our API from dhcproto internals. If dhcproto changes its RelayInfo representation, only the conversion function needs updating.</p>
+    </div>
+
+    <h2><span class="dot deviation"></span> Deviations</h2>
+    <div class="item">
+      <h3><span class="label label-deviation">Deviation</span> IPSec detection is a no-op placeholder</h3>
+      <p><strong>Spec said:</strong> Detect and skip DHCP packets protected by IPsec AH/ESP.</p>
+      <p><strong>Implemented:</strong> <code>is_ipsec_protected()</code> always returns false.</p>
+      <p><strong>Why:</strong> IPsec AH/ESP headers live at the IP layer. A DHCP relay operating on UDP payloads cannot inspect IP headers. The caller must perform this check at a lower layer and skip Option 82 processing before calling our functions.</p>
+    </div>
+    <div class="item">
+      <h3><span class="label label-deviation">Deviation</span> RFC 3396 long option encoding delegated to dhcproto</h3>
+      <p><strong>Spec said:</strong> Support RFC 3396 long option encoding (option data &gt; 255 bytes).</p>
+      <p><strong>Implemented:</strong> dhcproto's <code>encode_long_opt_bytes</code> handles this automatically during serialization.</p>
+      <p><strong>Why:</strong> No need to duplicate logic that dhcproto already provides. Verified via round-trip test.</p>
+    </div>
+
+    <h2><span class="dot tradeoff"></span> Tradeoffs</h2>
+    <div class="item">
+      <h3><span class="label label-tradeoff">Tradeoff</span> insert() rejects existing Option 82 vs silently skipping</h3>
+      <p><strong>Alternatives:</strong> (A) Error on duplicate; (B) Silently skip insertion if already present.</p>
+      <p><strong>Chose A:</strong> An existing Option 82 on a non-reforwarded packet is a protocol violation worth surfacing. The caller can check first if they want to skip silently.</p>
+    </div>
+
+    <h2><span class="dot question"></span> Open Questions</h2>
+    <div class="item">
+      <h3><span class="label label-question">Question</span> VSS sub-options via Option 82</h3>
+      <p>RFC 6607 VSS sub-options (151, 152) are encoded inside Option 82 alongside Circuit ID and Remote ID. The current <code>insert()</code> only handles the standard sub-options. VSS insertion will be added in Issue #6 — ensure it integrates with the existing Option 82 flow.</p>
+    </div>
+
+    <p class="footer">Generated by goal-workflow /note-it</p>
+  </div>
+</body>
+</html>

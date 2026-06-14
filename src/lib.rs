@@ -6,6 +6,9 @@ pub mod transport;
 #[cfg(feature = "dhcpv4")]
 pub mod dhcp;
 
+#[cfg(feature = "smf")]
+pub mod smf;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use config::RelayConfig;

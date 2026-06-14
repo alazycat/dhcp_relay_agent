@@ -9,17 +9,18 @@ license = "MIT"
 default = ["dhcpv4"]
 dhcpv4 = []
 dhcpv6 = []
-smf = []
+smf = ["dep:murmur3"]
 full = ["dhcpv4", "dhcpv6", "smf"]
 
 [dependencies]
 dhcproto = { version = "0.14", default-features = false }
-tokio = { version = "1", features = ["net", "sync", "time"] }
+tokio = { version = "1", features = ["net", "rt", "sync", "time"] }
 socket2 = "0.5"
 tracing = "0.1"
 thiserror = "2"
 dashmap = "6"
 serde = { version = "1", features = ["derive"] }
+murmur3 = { version = "0.5", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

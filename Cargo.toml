@@ -1,0 +1,30 @@
+[package]
+name = "dhcp-relay-agent"
+version = "0.1.0"
+edition = "2021"
+description = "DHCP Relay Agent library implementing RFC 3046, RFC 6607, and RFC 6621"
+license = "MIT"
+
+[features]
+default = ["dhcpv4"]
+dhcpv4 = []
+dhcpv6 = []
+smf = []
+full = ["dhcpv4", "dhcpv6", "smf"]
+
+[dependencies]
+dhcproto = { version = "0.14", default-features = false }
+tokio = { version = "1", features = ["net", "sync", "time"] }
+socket2 = "0.5"
+tracing = "0.1"
+thiserror = "2"
+dashmap = "6"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+
+[[example]]
+name = "simple_relay"
+required-features = ["dhcpv4"]

@@ -5,8 +5,11 @@ use dhcproto::{v4, Decodable, Encodable};
 use crate::error::{RelayError, RelayResult};
 use crate::pipeline::{Pipeline, PipelineContext, PipelineStage};
 
+use crate::config::VssConfig;
+
 use super::giaddr::{self, GiaddrDecision};
 use super::option82;
+use super::vss;
 
 // ── ParseStage ────────────────────────────────────────────────────────────
 
@@ -252,6 +255,130 @@ impl PipelineStage for ReplyAddrStage {
     }
 }
 
+// ── VssInsertStage ────────────────────────────────────────────────────────
+
+/// Inserts VSS sub-options (151/152) into Option 82 on client→server direction.
+struct VssInsertStage {
+    vss_config: VssConfig,
+}
+
+impl PipelineStage for VssInsertStage {
+    fn name(&self) -> &str {
+        "dhcpv4::vss::insert"
+    }
+
+    fn process(&self, ctx: &mut PipelineContext) -> RelayResult<bool> {
+        if !self.vss_config.enabled {
+            return Ok(true);
+        }
+
+        let (vss_data, _vss_control) = vss::encode_sub_opts(&self.vss_config)?;
+        // vss_data layout: [code, len, type, info...] — payload starts at offset 2
+        let vss_payload = vss_data[2..].to_vec();
+
+        let mut msg = v4::Message::decode(&mut dhcproto::Decoder::new(&ctx.buffer))
+            .map_err(|e| RelayError::Parse(format!("vss insert decode: {e}")))?;
+
+        if let Some(v4::DhcpOption::RelayAgentInformation(agent_info)) =
+            msg.opts_mut().get_mut(v4::OptionCode::RelayAgentInformation)
+        {
+            // Insert VSS sub-option (151)
+            agent_info.insert(v4::relay::RelayInfo::Unknown(
+                v4::relay::UnknownInfo::new(
+                    v4::relay::RelayCode::VirtualSubnet,
+                    vss_payload,
+                ),
+            ));
+            // Insert VSS-Control sub-option (152) — empty data
+            agent_info.insert(v4::relay::RelayInfo::Unknown(
+                v4::relay::UnknownInfo::new(
+                    v4::relay::RelayCode::VirtualSubnetControl,
+                    Vec::new(),
+                ),
+            ));
+        }
+
+        ctx.metadata
+            .insert("vss_inserted".into(), "true".into());
+
+        let mut buf = Vec::new();
+        msg.encode(&mut dhcproto::Encoder::new(&mut buf))
+            .map_err(|e| RelayError::Parse(format!("vss insert encode: {e}")))?;
+        ctx.buffer = buf;
+
+        Ok(true)
+    }
+}
+
+// ── VssCheckStage ─────────────────────────────────────────────────────────
+
+/// Checks server reply for VSS-Control removal and validates VPN name.
+struct VssCheckStage {
+    vss_config: VssConfig,
+}
+
+impl PipelineStage for VssCheckStage {
+    fn name(&self) -> &str {
+        "dhcpv4::vss::check"
+    }
+
+    fn process(&self, ctx: &mut PipelineContext) -> RelayResult<bool> {
+        if !self.vss_config.enabled {
+            return Ok(true);
+        }
+
+        let msg = v4::Message::decode(&mut dhcproto::Decoder::new(&ctx.buffer))
+            .map_err(|e| RelayError::Parse(format!("vss check decode: {e}")))?;
+
+        if let Some(v4::DhcpOption::RelayAgentInformation(info)) =
+            msg.opts().get(v4::OptionCode::RelayAgentInformation)
+        {
+                // Check if VSS-Control is still present (server doesn't support VSS)
+                let mut has_vss_control = false;
+                let mut vss_info: Option<Vec<u8>> = None;
+
+                for (code, ri) in info.iter() {
+                    match code {
+                        v4::relay::RelayCode::VirtualSubnetControl => {
+                            has_vss_control = true;
+                        }
+                        v4::relay::RelayCode::VirtualSubnet => {
+                            if let v4::relay::RelayInfo::Unknown(u) = ri {
+                                vss_info = Some(u.data().to_vec());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                if has_vss_control {
+                    tracing::warn!("server does not support VSS");
+                }
+
+                // VPN name validation
+                if let (Some(ref expected_vpn), Some(ref info_data)) =
+                    (&self.vss_config.vpn_name, &vss_info)
+                {
+                    if !info_data.is_empty()
+                        && self.vss_config.vss_type == vss::VSS_TYPE_NVT_ASCII
+                    {
+                        let vpn_name =
+                            std::str::from_utf8(&info_data[1..]).unwrap_or("");
+                        if vpn_name != expected_vpn.as_str() {
+                            tracing::warn!(
+                                vpn_name = vpn_name,
+                                expected = expected_vpn.as_str(),
+                                "VPN name mismatch"
+                            );
+                        }
+                    }
+                }
+        }
+
+        Ok(true)
+    }
+}
+
 // ── Dhcpv4Pipeline ────────────────────────────────────────────────────────
 
 /// Builder for DHCPv4 request and reply processing pipelines.
@@ -260,38 +387,48 @@ pub struct Dhcpv4Pipeline;
 impl Dhcpv4Pipeline {
     /// Build the client→server (request relay) pipeline.
     ///
-    /// Stages: Parse → Validate → Option82(insert) → Giaddr(set) → Forward
+    /// Stages: Parse → Validate → Option82(insert) → VSS(insert) → Giaddr(set) → Forward
     pub fn build_request(
         local_addrs: Vec<Ipv4Addr>,
         circuit_id: Option<Vec<u8>>,
         remote_id: Option<Vec<u8>>,
         iface_ip: Ipv4Addr,
         server_addr: SocketAddr,
+        vss_config: Option<VssConfig>,
     ) -> Pipeline {
-        let stages: Vec<Box<dyn PipelineStage>> = vec![
+        let mut stages: Vec<Box<dyn PipelineStage>> = vec![
             Box::new(ParseStage),
             Box::new(ValidateStage { local_addrs }),
             Box::new(Option82InsertStage {
                 circuit_id,
                 remote_id,
             }),
-            Box::new(GiaddrStage { iface_ip }),
-            Box::new(ForwardStage { dest: server_addr }),
         ];
+
+        if let Some(cfg) = vss_config {
+            stages.push(Box::new(VssInsertStage { vss_config: cfg }));
+        }
+
+        stages.push(Box::new(GiaddrStage { iface_ip }));
+        stages.push(Box::new(ForwardStage { dest: server_addr }));
         Pipeline::with_stages(stages)
     }
 
     /// Build the server→client (reply relay) pipeline.
     ///
-    /// Stages: Parse → Option82(strip+echo check) → ReplyAddr(resolve) → Forward
+    /// Stages: Parse → VSS(check) → Option82(strip+echo) → ReplyAddr(resolve)
     pub fn build_reply(
         expected_sub_opts: Option<Vec<option82::SubOption>>,
+        vss_config: Option<VssConfig>,
     ) -> Pipeline {
-        let stages: Vec<Box<dyn PipelineStage>> = vec![
-            Box::new(ParseStage),
-            Box::new(Option82StripStage { expected_sub_opts }),
-            Box::new(ReplyAddrStage),
-        ];
+        let mut stages: Vec<Box<dyn PipelineStage>> = vec![Box::new(ParseStage)];
+
+        if let Some(cfg) = vss_config {
+            stages.push(Box::new(VssCheckStage { vss_config: cfg }));
+        }
+
+        stages.push(Box::new(Option82StripStage { expected_sub_opts }));
+        stages.push(Box::new(ReplyAddrStage));
         Pipeline::with_stages(stages)
     }
 }
@@ -329,6 +466,7 @@ mod tests {
             Some(b"relay1".to_vec()),
             Ipv4Addr::new(10, 0, 0, 1),
             server,
+            None,
         );
 
         let mut ctx = client_context();
@@ -359,6 +497,7 @@ mod tests {
             None,
             Ipv4Addr::new(10, 0, 0, 1),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 100)), 67),
+            None,
         );
 
         let mut ctx = client_context();
@@ -392,7 +531,7 @@ mod tests {
 
         let expected = vec![option82::SubOption::new(1, b"eth0".to_vec())];
 
-        let mut pipeline = Dhcpv4Pipeline::build_reply(Some(expected));
+        let mut pipeline = Dhcpv4Pipeline::build_reply(Some(expected), None);
 
         let mut ctx = client_context();
         ctx.buffer = buf;
@@ -429,7 +568,7 @@ mod tests {
         // Expected is different from what server echoed
         let expected = vec![option82::SubOption::new(1, b"eth0".to_vec())];
 
-        let mut pipeline = Dhcpv4Pipeline::build_reply(Some(expected));
+        let mut pipeline = Dhcpv4Pipeline::build_reply(Some(expected), None);
 
         let mut ctx = client_context();
         ctx.buffer = buf;
@@ -448,6 +587,7 @@ mod tests {
             Some(b"relay1".to_vec()),
             Ipv4Addr::new(10, 0, 0, 1),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 100)), 67),
+            None,
         );
 
         let mut ctx = client_context();

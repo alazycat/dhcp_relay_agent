@@ -2,12 +2,14 @@ use std::net::SocketAddr;
 
 use dhcproto::{v6, Decodable, Encodable};
 
+use crate::config::VssConfig;
 use crate::error::{RelayError, RelayResult};
 use crate::pipeline::{Pipeline, PipelineContext, PipelineStage};
 
 use super::interface_id;
 use super::relay_fwd::RelayFwdCodec;
 use super::remote_id;
+use super::vss;
 
 // ── ParseStage ────────────────────────────────────────────────────────────
 
@@ -173,6 +175,81 @@ impl PipelineStage for ForwardStage {
     }
 }
 
+// ── VssInsertStage ────────────────────────────────────────────────────────
+
+struct VssInsertStage {
+    vss_config: VssConfig,
+}
+
+impl PipelineStage for VssInsertStage {
+    fn name(&self) -> &str {
+        "dhcpv6::vss::insert"
+    }
+
+    fn process(&self, ctx: &mut PipelineContext) -> RelayResult<bool> {
+        if !self.vss_config.enabled {
+            return Ok(true);
+        }
+
+        let vss_opt = vss::encode(&self.vss_config)?;
+
+        let mut msg = v6::Message::decode(&mut dhcproto::Decoder::new(&ctx.buffer))
+            .map_err(|e| RelayError::Parse(format!("v6 vss decode: {e}")))?;
+
+        msg.opts_mut().insert(vss_opt);
+
+        ctx.metadata
+            .insert("vss_inserted".into(), "true".into());
+
+        let mut buf = Vec::new();
+        msg.encode(&mut dhcproto::Encoder::new(&mut buf))
+            .map_err(|e| RelayError::Parse(format!("v6 vss encode: {e}")))?;
+        ctx.buffer = buf;
+
+        Ok(true)
+    }
+}
+
+// ── VssExtractStage ───────────────────────────────────────────────────────
+
+struct VssExtractStage {
+    vss_config: VssConfig,
+}
+
+impl PipelineStage for VssExtractStage {
+    fn name(&self) -> &str {
+        "dhcpv6::vss::extract"
+    }
+
+    fn process(&self, ctx: &mut PipelineContext) -> RelayResult<bool> {
+        if !self.vss_config.enabled {
+            return Ok(true);
+        }
+
+        let msg = v6::Message::decode(&mut dhcproto::Decoder::new(&ctx.buffer))
+            .map_err(|e| RelayError::Parse(format!("v6 vss extract decode: {e}")))?;
+
+        let opts: Vec<_> = msg.opts().iter().cloned().collect();
+        if let Some((vss_type, vss_info)) = vss::extract(&opts) {
+            if let Some(ref expected_vpn) = self.vss_config.vpn_name {
+                if vss_type == 0 {
+                    // NVT ASCII
+                    let vpn_name = std::str::from_utf8(&vss_info).unwrap_or("");
+                    if vpn_name != expected_vpn.as_str() {
+                        tracing::warn!(
+                            vpn_name = vpn_name,
+                            expected = expected_vpn.as_str(),
+                            "VPN name mismatch"
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(true)
+    }
+}
+
 // ── Dhcpv6Pipeline ────────────────────────────────────────────────────────
 
 pub struct Dhcpv6Pipeline;
@@ -180,37 +257,49 @@ pub struct Dhcpv6Pipeline;
 impl Dhcpv6Pipeline {
     /// Build the client→server (request relay) pipeline.
     ///
-    /// Stages: Parse → InterfaceId(insert) → RemoteId(insert) → RelayFwd(encapsulate) → Forward
+    /// Stages: Parse → InterfaceId → RemoteId → VSS(insert) → RelayFwd → Forward
     pub fn build_request(
         iface_name: String,
         remote_id: Vec<u8>,
         link_addr: std::net::Ipv6Addr,
         peer_addr: SocketAddr,
         server_addr: SocketAddr,
+        vss_config: Option<VssConfig>,
     ) -> Pipeline {
-        let stages: Vec<Box<dyn PipelineStage>> = vec![
+        let mut stages: Vec<Box<dyn PipelineStage>> = vec![
             Box::new(ParseStage),
             Box::new(InterfaceIdStage { iface_name }),
             Box::new(RemoteIdStage { remote_id }),
-            Box::new(RelayFwdStage {
-                link_addr,
-                peer_addr,
-            }),
-            Box::new(ForwardStage { dest: server_addr }),
         ];
+
+        if let Some(cfg) = vss_config {
+            stages.push(Box::new(VssInsertStage { vss_config: cfg }));
+        }
+
+        stages.push(Box::new(RelayFwdStage {
+            link_addr,
+            peer_addr,
+        }));
+        stages.push(Box::new(ForwardStage { dest: server_addr }));
         Pipeline::with_stages(stages)
     }
 
     /// Build the server→client (reply relay) pipeline.
     ///
-    /// Stages: Parse → RelayReply(decapsulate) → InterfaceIdExtract → Forward
-    pub fn build_reply(client_addr: SocketAddr) -> Pipeline {
-        let stages: Vec<Box<dyn PipelineStage>> = vec![
-            Box::new(ParseStage),
-            Box::new(RelayReplyStage),
-            Box::new(InterfaceIdExtractStage),
-            Box::new(ForwardStage { dest: client_addr }),
-        ];
+    /// Stages: Parse → VSS(extract) → RelayReply(decapsulate) → InterfaceIdExtract → Forward
+    pub fn build_reply(
+        client_addr: SocketAddr,
+        vss_config: Option<VssConfig>,
+    ) -> Pipeline {
+        let mut stages: Vec<Box<dyn PipelineStage>> = vec![Box::new(ParseStage)];
+
+        if let Some(cfg) = vss_config {
+            stages.push(Box::new(VssExtractStage { vss_config: cfg }));
+        }
+
+        stages.push(Box::new(RelayReplyStage));
+        stages.push(Box::new(InterfaceIdExtractStage));
+        stages.push(Box::new(ForwardStage { dest: client_addr }));
         Pipeline::with_stages(stages)
     }
 }
@@ -242,6 +331,7 @@ mod tests {
             link,
             peer,
             server,
+            None,
         );
 
         let mut ctx = PipelineContext::new(
@@ -278,7 +368,7 @@ mod tests {
         reply[0] = 13; // RELAY_REPL
 
         let client = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 546);
-        let mut pipeline = Dhcpv6Pipeline::build_reply(client);
+        let mut pipeline = Dhcpv6Pipeline::build_reply(client, None);
 
         let mut ctx = PipelineContext::new(
             vec![],

@@ -70,6 +70,9 @@ pub struct Dhcpv4Config {
     /// Remote ID value (sub-option 2). None = use relay agent's IP.
     #[serde(default)]
     pub remote_id: Option<String>,
+    /// VSS (Virtual Subnet Selection) configuration (RFC 6607).
+    #[serde(default)]
+    pub vss: VssConfig,
 }
 
 impl Default for Dhcpv4Config {
@@ -79,6 +82,7 @@ impl Default for Dhcpv4Config {
             enable_option82: true,
             circuit_id: None,
             remote_id: None,
+            vss: VssConfig::default(),
         }
     }
 }
@@ -98,6 +102,9 @@ pub struct Dhcpv6Config {
     /// Remote ID value. None = use relay agent's DUID.
     #[serde(default)]
     pub remote_id: Option<Vec<u8>>,
+    /// VSS (Virtual Subnet Selection) configuration (RFC 6607).
+    #[serde(default)]
+    pub vss: VssConfig,
 }
 
 impl Default for Dhcpv6Config {
@@ -107,6 +114,7 @@ impl Default for Dhcpv6Config {
             enable_interface_id: true,
             enable_remote_id: true,
             remote_id: None,
+            vss: VssConfig::default(),
         }
     }
 }

@@ -57,12 +57,10 @@ impl SmfEngine {
         ingress_iface: &str,
         prev_hop: IpAddr,
     ) -> RelayResult<Option<Vec<u8>>> {
-        // Step 1: Forwarding rules check
         if !forwarding::check_forwarding_rules(src_addr, dst_addr, ttl, &self.local_addrs) {
             return Ok(None);
         }
 
-        // Step 2: Relay set selection
         if !self
             .relay_selector
             .should_forward(ingress_iface, prev_hop, src_addr, dst_addr)
@@ -70,24 +68,22 @@ impl SmfEngine {
             return Ok(None);
         }
 
-        // Step 3: Decrement TTL/hop-limit and forward
         let mut modified = packet.to_vec();
-
-        // Locate the TTL field. For IPv4 it's at offset 8; for IPv6 hop-limit at offset 7.
-        match dst_addr {
-            IpAddr::V4(_) => {
-                if modified.len() > 8 {
-                    modified[8] = ttl - 1;
-                }
-            }
-            IpAddr::V6(_) => {
-                if modified.len() > 7 {
-                    modified[7] = ttl - 1;
-                }
-            }
-        }
-
+        decrement_ttl(&mut modified, dst_addr, ttl);
         Ok(Some(modified))
+    }
+}
+
+/// Decrement the TTL (IPv4) or Hop Limit (IPv6) field in-place.
+///
+/// IPv4 TTL is at byte offset 8; IPv6 Hop Limit is at byte offset 7.
+fn decrement_ttl(packet: &mut [u8], addr: IpAddr, ttl: u8) {
+    let offset = match addr {
+        IpAddr::V4(_) => 8,
+        IpAddr::V6(_) => 7,
+    };
+    if packet.len() > offset {
+        packet[offset] = ttl.saturating_sub(1);
     }
 }
 

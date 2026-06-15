@@ -1,12 +1,21 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
-use crate::error::RelayResult;
+use crate::error::{RelayError, RelayResult};
+
+#[cfg(any(feature = "dhcpv4", feature = "dhcpv6"))]
+use dhcproto::{Decodable, Encodable};
+
+#[cfg(feature = "dhcpv4")]
+use dhcproto::v4;
+#[cfg(feature = "dhcpv6")]
+use dhcproto::v6;
 
 /// Context passed through each stage of the DHCP processing pipeline.
 pub struct PipelineContext {
     /// Original inbound packet bytes (unmodified reference for echo verification).
-    pub raw_in: Vec<u8>,
+    #[allow(dead_code)]
+    pub(crate) raw_in: Vec<u8>,
     /// Working buffer — stages read from and write to this.
     pub buffer: Vec<u8>,
     /// Source address of the received packet.
@@ -36,6 +45,38 @@ impl PipelineContext {
             is_trusted_circuit: false,
             metadata: HashMap::new(),
         }
+    }
+
+    /// Decode the buffer as a DHCPv4 message, apply `f`, and re-encode back.
+    #[cfg(feature = "dhcpv4")]
+    pub fn modify_v4<F>(&mut self, stage: &str, f: F) -> RelayResult<()>
+    where
+        F: FnOnce(&mut v4::Message) -> RelayResult<()>,
+    {
+        let mut msg = v4::Message::decode(&mut dhcproto::Decoder::new(&self.buffer))
+            .map_err(|e| RelayError::Parse(format!("{stage} decode: {e}")))?;
+        f(&mut msg)?;
+        let mut buf = Vec::new();
+        msg.encode(&mut dhcproto::Encoder::new(&mut buf))
+            .map_err(|e| RelayError::Parse(format!("{stage} encode: {e}")))?;
+        self.buffer = buf;
+        Ok(())
+    }
+
+    /// Decode the buffer as a DHCPv6 message, apply `f`, and re-encode back.
+    #[cfg(feature = "dhcpv6")]
+    pub fn modify_v6<F>(&mut self, stage: &str, f: F) -> RelayResult<()>
+    where
+        F: FnOnce(&mut v6::Message) -> RelayResult<()>,
+    {
+        let mut msg = v6::Message::decode(&mut dhcproto::Decoder::new(&self.buffer))
+            .map_err(|e| RelayError::Parse(format!("{stage} decode: {e}")))?;
+        f(&mut msg)?;
+        let mut buf = Vec::new();
+        msg.encode(&mut dhcproto::Encoder::new(&mut buf))
+            .map_err(|e| RelayError::Parse(format!("{stage} encode: {e}")))?;
+        self.buffer = buf;
+        Ok(())
     }
 }
 

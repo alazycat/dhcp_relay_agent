@@ -32,50 +32,44 @@ pub enum RelayEvent {
     Error { message: String },
 }
 
-/// Runtime statistics for the relay agent.
-#[derive(Debug, Default)]
-pub struct RelayStats {
-    pub packets_received: AtomicU64,
-    pub packets_forwarded: AtomicU64,
-    pub packets_dropped_parse_error: AtomicU64,
-    pub packets_dropped_spoof: AtomicU64,
-    pub option82_inserted: AtomicU64,
-    pub option82_stripped: AtomicU64,
-    pub vss_not_supported: AtomicU64,
-    pub smf_duplicates_detected: AtomicU64,
-    pub smf_forwarded: AtomicU64,
-}
-
-impl RelayStats {
-    /// Return a snapshot of all counter values.
-    pub fn snapshot(&self) -> RelayStatsSnapshot {
-        RelayStatsSnapshot {
-            packets_received: self.packets_received.load(Ordering::Relaxed),
-            packets_forwarded: self.packets_forwarded.load(Ordering::Relaxed),
-            packets_dropped_parse_error: self.packets_dropped_parse_error.load(Ordering::Relaxed),
-            packets_dropped_spoof: self.packets_dropped_spoof.load(Ordering::Relaxed),
-            option82_inserted: self.option82_inserted.load(Ordering::Relaxed),
-            option82_stripped: self.option82_stripped.load(Ordering::Relaxed),
-            vss_not_supported: self.vss_not_supported.load(Ordering::Relaxed),
-            smf_duplicates_detected: self.smf_duplicates_detected.load(Ordering::Relaxed),
-            smf_forwarded: self.smf_forwarded.load(Ordering::Relaxed),
+/// Define relay statistics counters and their snapshot type.
+///
+/// Each counter is declared once; the macro generates the `AtomicU64`-backed
+/// `RelayStats` struct, the serializable `RelayStatsSnapshot` struct, and the
+/// `snapshot()` mapping between them.
+macro_rules! define_stats {
+    ($($name:ident),* $(,)?) => {
+        #[derive(Debug, Default)]
+        pub struct RelayStats {
+            $(pub $name: AtomicU64),*
         }
-    }
+
+        impl RelayStats {
+            pub fn snapshot(&self) -> RelayStatsSnapshot {
+                RelayStatsSnapshot {
+                    $($name: self.$name.load(Ordering::Relaxed)),*
+                }
+            }
+        }
+
+        #[derive(Debug, Clone, Default, serde::Serialize)]
+        pub struct RelayStatsSnapshot {
+            $(pub $name: u64),*
+        }
+    };
 }
 
-/// A snapshot of `RelayStats` counter values (serializable).
-#[derive(Debug, Clone, Default, serde::Serialize)]
-pub struct RelayStatsSnapshot {
-    pub packets_received: u64,
-    pub packets_forwarded: u64,
-    pub packets_dropped_parse_error: u64,
-    pub packets_dropped_spoof: u64,
-    pub option82_inserted: u64,
-    pub option82_stripped: u64,
-    pub vss_not_supported: u64,
-    pub smf_duplicates_detected: u64,
-    pub smf_forwarded: u64,
-}
+define_stats!(
+    packets_received,
+    packets_forwarded,
+    packets_dropped_parse_error,
+    packets_dropped_spoof,
+    option82_inserted,
+    option82_stripped,
+    vss_not_supported,
+    smf_duplicates_detected,
+    smf_forwarded,
+);
 
 struct Inner {
     config: RelayConfig,
@@ -85,6 +79,191 @@ struct Inner {
     topology_provider: std::sync::Mutex<Option<Box<dyn TopologyProvider>>>,
     #[cfg(feature = "smf")]
     relay_selector: std::sync::Mutex<Option<Box<dyn RelaySetSelector>>>,
+}
+
+#[cfg(feature = "dhcpv4")]
+#[derive(Clone)]
+struct V4SpawnContext {
+    inner: Arc<Inner>,
+    enable_option82: bool,
+    vss_enabled: bool,
+    vss_cfg: config::VssConfig,
+    circuit_id: Option<Vec<u8>>,
+    remote_id: Option<Vec<u8>>,
+    local_addrs: Vec<std::net::Ipv4Addr>,
+}
+
+#[cfg(feature = "dhcpv4")]
+impl V4SpawnContext {
+    fn from_inner(inner: &Arc<Inner>) -> Self {
+        let cfg = &inner.config.dhcpv4;
+        Self {
+            inner: inner.clone(),
+            enable_option82: cfg.enable_option82,
+            vss_enabled: cfg.vss.enabled,
+            vss_cfg: cfg.vss.clone(),
+            circuit_id: cfg.circuit_id.as_ref().map(|s| s.as_bytes().to_vec()),
+            remote_id: cfg.remote_id.as_ref().map(|s| s.as_bytes().to_vec()),
+            local_addrs: inner.config.interfaces.iter()
+                .filter_map(|i| i.ip_addr.split(':').next()?.parse().ok())
+                .collect(),
+        }
+    }
+}
+
+#[cfg(feature = "dhcpv6")]
+#[derive(Clone)]
+struct V6SpawnContext {
+    inner: Arc<Inner>,
+    enable_interface_id: bool,
+    enable_remote_id: bool,
+    vss_enabled: bool,
+    vss_cfg: config::VssConfig,
+    remote_id: Vec<u8>,
+}
+
+#[cfg(feature = "dhcpv6")]
+impl V6SpawnContext {
+    fn from_inner(inner: &Arc<Inner>) -> Self {
+        let cfg = &inner.config.dhcpv6;
+        Self {
+            inner: inner.clone(),
+            enable_interface_id: cfg.enable_interface_id,
+            enable_remote_id: cfg.enable_remote_id,
+            vss_enabled: cfg.vss.enabled,
+            vss_cfg: cfg.vss.clone(),
+            remote_id: cfg.remote_id.clone().unwrap_or_default(),
+        }
+    }
+}
+
+#[cfg(feature = "dhcpv4")]
+#[allow(clippy::too_many_arguments)]
+async fn handle_v4_client(
+    data: Vec<u8>,
+    src: std::net::SocketAddr,
+    iface_name: String,
+    iface_ip: std::net::Ipv4Addr,
+    local_addrs: Vec<std::net::Ipv4Addr>,
+    circuit_id: Option<Vec<u8>>,
+    remote_id: Option<Vec<u8>>,
+    server_addr: std::net::SocketAddr,
+    vss_cfg: Option<config::VssConfig>,
+    enable_option82: bool,
+    stats: &RelayStats,
+    transport: &impl transport::Transport,
+) {
+    let mut ctx = pipeline::PipelineContext::new(data, src, iface_name);
+    let mut pipeline = dhcp::v4::pipeline::build_request(
+        local_addrs, circuit_id, remote_id, iface_ip, server_addr, vss_cfg, enable_option82,
+    );
+    match pipeline.execute(&mut ctx) {
+        Ok(true) => {
+            stats.packets_forwarded.fetch_add(1, Ordering::Relaxed);
+            if let Some(dst) = ctx.dst_addr {
+                let _ = transport.send_to(&ctx.buffer, dst).await;
+            }
+        }
+        Ok(false) => {}
+        Err(_) => {
+            stats.packets_dropped_spoof.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(feature = "dhcpv4")]
+#[allow(clippy::too_many_arguments)]
+async fn handle_v4_server(
+    data: Vec<u8>,
+    src: std::net::SocketAddr,
+    iface_name: String,
+    expected_sub_opts: Option<Vec<dhcp::v4::option82::SubOption>>,
+    vss_cfg: Option<config::VssConfig>,
+    enable_option82: bool,
+    stats: &RelayStats,
+    transport: &impl transport::Transport,
+) {
+    let mut ctx = pipeline::PipelineContext::new(data, src, iface_name);
+    let mut pipeline = dhcp::v4::pipeline::build_reply(
+        expected_sub_opts, vss_cfg, enable_option82,
+    );
+    match pipeline.execute(&mut ctx) {
+        Ok(true) => {
+            stats.packets_forwarded.fetch_add(1, Ordering::Relaxed);
+            stats.option82_stripped.fetch_add(1, Ordering::Relaxed);
+            if let Some(dst) = ctx.dst_addr {
+                let _ = transport.send_to(&ctx.buffer, dst).await;
+            }
+        }
+        Ok(false) => {}
+        Err(_) => {}
+    }
+}
+
+#[cfg(feature = "dhcpv6")]
+#[allow(clippy::too_many_arguments)]
+async fn handle_v6_client(
+    data: Vec<u8>,
+    src: std::net::SocketAddr,
+    iface_name: String,
+    remote_id: Vec<u8>,
+    server_addr: std::net::SocketAddr,
+    vss_cfg: Option<config::VssConfig>,
+    enable_interface_id: bool,
+    enable_remote_id: bool,
+    stats: &RelayStats,
+    transport: &impl transport::Transport,
+) {
+    use std::net::Ipv6Addr;
+
+    let link_addr = transport
+        .local_addr()
+        .map(|a| match a.ip() {
+            std::net::IpAddr::V6(ip) => ip,
+            _ => Ipv6Addr::UNSPECIFIED,
+        })
+        .unwrap_or(Ipv6Addr::UNSPECIFIED);
+
+    let mut ctx = pipeline::PipelineContext::new(data, src, iface_name.clone());
+    let mut pipeline = dhcp::v6::pipeline::build_request(
+        iface_name, remote_id, link_addr, src, server_addr, vss_cfg,
+        enable_interface_id, enable_remote_id,
+    );
+    match pipeline.execute(&mut ctx) {
+        Ok(true) => {
+            stats.packets_forwarded.fetch_add(1, Ordering::Relaxed);
+            if let Some(dst) = ctx.dst_addr {
+                let _ = transport.send_to(&ctx.buffer, dst).await;
+            }
+        }
+        Ok(false) => {}
+        Err(_) => {}
+    }
+}
+
+#[cfg(feature = "dhcpv6")]
+async fn handle_v6_server(
+    data: Vec<u8>,
+    src: std::net::SocketAddr,
+    iface_name: String,
+    vss_cfg: Option<config::VssConfig>,
+    stats: &RelayStats,
+    transport: &impl transport::Transport,
+) {
+    let mut ctx = pipeline::PipelineContext::new(data, src, iface_name);
+    let mut pipeline = dhcp::v6::pipeline::build_reply(
+        src, vss_cfg,
+    );
+    match pipeline.execute(&mut ctx) {
+        Ok(true) => {
+            stats.packets_forwarded.fetch_add(1, Ordering::Relaxed);
+            if let Some(dst) = ctx.dst_addr {
+                let _ = transport.send_to(&ctx.buffer, dst).await;
+            }
+        }
+        Ok(false) => {}
+        Err(_) => {}
+    }
 }
 
 /// Top-level relay agent handle.
@@ -153,21 +332,19 @@ impl RelayAgent {
     #[cfg(feature = "dhcpv4")]
     async fn spawn_v4_tasks(&self) -> RelayResult<Vec<tokio::task::JoinHandle<()>>> {
         use std::net::Ipv4Addr;
-
         use dhcproto::{v4, Decodable};
-        use pipeline::PipelineContext;
 
         let mut handles = Vec::new();
         let shutdown_rx = self.inner.shutdown_tx.subscribe();
-        let inner = self.inner.clone();
+        let spawn_ctx = V4SpawnContext::from_inner(&self.inner);
+        let default_server = self.inner.config.dhcpv4.server_addrs.first().copied();
 
         for iface in &self.inner.config.interfaces {
             if !iface.enabled {
                 continue;
             }
 
-            let bind_addr: std::net::SocketAddr = iface
-                .ip_addr
+            let bind_addr: std::net::SocketAddr = iface.ip_addr
                 .parse()
                 .map_err(|e| RelayError::Config(format!("invalid IP: {e}")))?;
 
@@ -176,14 +353,14 @@ impl RelayAgent {
                 .map_err(|e| RelayError::Transport(format!("bind: {e}")))?;
 
             let iface_name = iface.name.clone();
-            let iface_ip: Ipv4Addr = iface
-                .ip_addr
-                .split(':')
-                .next()
+            let iface_ip: Ipv4Addr = iface.ip_addr
+                .split(':').next()
                 .unwrap_or("0.0.0.0")
                 .parse()
                 .unwrap_or(Ipv4Addr::UNSPECIFIED);
-            let inner = inner.clone();
+            let server_addr = default_server.unwrap_or(bind_addr);
+
+            let ctx = spawn_ctx.clone();
             let mut sr = shutdown_rx.clone();
 
             let handle = tokio::spawn(async move {
@@ -197,107 +374,50 @@ impl RelayAgent {
                         }
                         result = transport.recv_from() => {
                             if let Ok((data, src)) = result {
-                                inner.stats.packets_received.fetch_add(1, Ordering::Relaxed);
+                                ctx.inner.stats.packets_received.fetch_add(1, Ordering::Relaxed);
 
                                 if let Ok(msg) = v4::Message::decode(
                                     &mut dhcproto::Decoder::new(&data)
                                 ) {
                                     let is_client = msg.opts().msg_type().map(|t| {
-                                        t == v4::MessageType::Discover
-                                            || t == v4::MessageType::Request
+                                        matches!(t,
+                                            v4::MessageType::Discover
+                                            | v4::MessageType::Request
+                                            | v4::MessageType::Inform
+                                            | v4::MessageType::Decline
+                                            | v4::MessageType::Release
+                                        )
                                     }).unwrap_or(false);
 
-                                    if is_client && inner.config.dhcpv4.enable_option82 {
-                                        let mut ctx = PipelineContext::new(
-                                            data,
-                                            src,
-                                            iface_name.clone(),
-                                        );
-
-                                        let local_addrs: Vec<Ipv4Addr> = inner
-                                            .config
-                                            .interfaces
-                                            .iter()
-                                            .filter_map(|i| i.ip_addr.split(':').next()?.parse().ok())
-                                            .collect();
-
-                                        let vss_cfg = if inner.config.dhcpv4.vss.enabled {
-                                            Some(inner.config.dhcpv4.vss.clone())
-                                        } else {
-                                            None
-                                        };
-
-                                        let mut pipeline = dhcp::v4::pipeline::Dhcpv4Pipeline::build_request(
-                                            local_addrs,
-                                            inner.config.dhcpv4.circuit_id.as_ref().map(|s| s.as_bytes().to_vec()),
-                                            inner.config.dhcpv4.remote_id.as_ref().map(|s| s.as_bytes().to_vec()),
-                                            iface_ip,
-                                            inner.config.dhcpv4.server_addrs.first().copied().unwrap_or(bind_addr),
-                                            vss_cfg,
-                                        );
-
-                                        match pipeline.execute(&mut ctx) {
-                                            Ok(true) => {
-                                                inner.stats.packets_forwarded.fetch_add(1, Ordering::Relaxed);
-                                                if let Some(dst) = ctx.dst_addr {
-                                                    let _ = transport.send_to(&ctx.buffer, dst).await;
-                                                }
-                                            }
-                                            Ok(false) => {}
-                                            Err(_) => {
-                                                inner.stats.packets_dropped_spoof.fetch_add(1, Ordering::Relaxed);
-                                            }
-                                        }
-                                    } else if !is_client && inner.config.dhcpv4.enable_option82 {
-                                        // Server→Client reply: extract echoed Option 82,
-                                        // strip it with echo validation, and forward to client.
-                                        let expected_sub_opts = msg
-                                            .opts()
+                                    if is_client {
+                                        handle_v4_client(
+                                            data, src, iface_name.clone(), iface_ip,
+                                            ctx.local_addrs.clone(), ctx.circuit_id.clone(),
+                                            ctx.remote_id.clone(), server_addr,
+                                            ctx.vss_enabled.then(|| ctx.vss_cfg.clone()),
+                                            ctx.enable_option82,
+                                            &ctx.inner.stats, &transport,
+                                        ).await;
+                                    } else {
+                                        let expected_sub_opts = msg.opts()
                                             .get(v4::OptionCode::RelayAgentInformation)
                                             .and_then(|opt| {
                                                 if let v4::DhcpOption::RelayAgentInformation(info) = opt {
-                                                    Some(
-                                                        info.iter()
-                                                            .map(|(_, ri)| {
-                                                                dhcp::v4::option82::relay_info_to_sub_opt(ri)
-                                                            })
-                                                            .collect::<Vec<_>>(),
-                                                    )
+                                                    Some(info.iter()
+                                                        .map(|(_, ri)| dhcp::v4::option82::relay_info_to_sub_opt(ri))
+                                                        .collect::<Vec<_>>())
                                                 } else {
                                                     None
                                                 }
                                             });
 
-                                        let mut ctx = PipelineContext::new(
-                                            data,
-                                            src,
-                                            iface_name.clone(),
-                                        );
-
-                                        let vss_cfg = if inner.config.dhcpv4.vss.enabled {
-                                            Some(inner.config.dhcpv4.vss.clone())
-                                        } else {
-                                            None
-                                        };
-
-                                        let mut pipeline = dhcp::v4::pipeline::Dhcpv4Pipeline::build_reply(
+                                        handle_v4_server(
+                                            data, src, iface_name.clone(),
                                             expected_sub_opts,
-                                            vss_cfg,
-                                        );
-
-                                        match pipeline.execute(&mut ctx) {
-                                            Ok(true) => {
-                                                inner.stats.packets_forwarded.fetch_add(1, Ordering::Relaxed);
-                                                inner.stats.option82_stripped.fetch_add(1, Ordering::Relaxed);
-                                                if let Some(dst) = ctx.dst_addr {
-                                                    let _ = transport.send_to(&ctx.buffer, dst).await;
-                                                }
-                                            }
-                                            Ok(false) => {}
-                                            Err(_) => {
-                                                // Option82 echo mismatch or parse error — drop
-                                            }
-                                        }
+                                            ctx.vss_enabled.then(|| ctx.vss_cfg.clone()),
+                                            ctx.enable_option82,
+                                            &ctx.inner.stats, &transport,
+                                        ).await;
                                     }
                                 }
                             }
@@ -315,21 +435,18 @@ impl RelayAgent {
     /// Spawn DHCPv6 relay tasks — one per interface on port 547.
     #[cfg(feature = "dhcpv6")]
     async fn spawn_v6_tasks(&self) -> RelayResult<Vec<tokio::task::JoinHandle<()>>> {
-        use std::net::Ipv6Addr;
-
         use dhcproto::{v6, Decodable};
-        use pipeline::PipelineContext;
 
         let mut handles = Vec::new();
         let shutdown_rx = self.inner.shutdown_tx.subscribe();
-        let inner = self.inner.clone();
+        let spawn_ctx = V6SpawnContext::from_inner(&self.inner);
+        let default_server = self.inner.config.dhcpv6.server_addrs.first().copied();
 
         for iface in &self.inner.config.interfaces {
             if !iface.enabled {
                 continue;
             }
 
-            // Parse the interface IP, replacing port with 547 for DHCPv6
             let iface_ip_str = iface.ip_addr.split(':').next().unwrap_or("::");
             let bind_addr: std::net::SocketAddr = format!("{iface_ip_str}:547")
                 .parse()
@@ -340,7 +457,9 @@ impl RelayAgent {
                 .map_err(|e| RelayError::Transport(format!("v6 bind: {e}")))?;
 
             let iface_name = iface.name.clone();
-            let inner = inner.clone();
+            let server_addr = default_server.unwrap_or(bind_addr);
+
+            let ctx = spawn_ctx.clone();
             let mut sr = shutdown_rx.clone();
 
             let handle = tokio::spawn(async move {
@@ -354,50 +473,19 @@ impl RelayAgent {
                         }
                         result = transport.recv_from() => {
                             if let Ok((data, src)) = result {
-                                inner.stats.packets_received.fetch_add(1, Ordering::Relaxed);
+                                ctx.inner.stats.packets_received.fetch_add(1, Ordering::Relaxed);
 
-                                // Determine direction: check first byte for RELAY_REPL (13)
-                                // vs client-originated message types (1=SOLICIT, 3=REQ, etc.)
                                 let first_byte = data.first().copied().unwrap_or(0);
 
-                                if first_byte == 13 {
-                                    // Server→Client RELAY_REPL: decapsulate and forward
-                                    if inner.config.dhcpv6.enable_interface_id {
-                                        let mut ctx = PipelineContext::new(
-                                            data,
-                                            src,
-                                            iface_name.clone(),
-                                        );
-
-                                        // Forward to the original client peer
-                                        let client_addr = src; // reply goes back to client from recv interface
-
-                                        let vss_cfg = if inner.config.dhcpv6.vss.enabled {
-                                            Some(inner.config.dhcpv6.vss.clone())
-                                        } else {
-                                            None
-                                        };
-
-                                        let mut pipeline = dhcp::v6::pipeline::Dhcpv6Pipeline::build_reply(
-                                            client_addr,
-                                            vss_cfg,
-                                        );
-
-                                        match pipeline.execute(&mut ctx) {
-                                            Ok(true) => {
-                                                inner.stats.packets_forwarded.fetch_add(1, Ordering::Relaxed);
-                                                if let Some(dst) = ctx.dst_addr {
-                                                    let _ = transport.send_to(&ctx.buffer, dst).await;
-                                                }
-                                            }
-                                            Ok(false) => {}
-                                            Err(_) => {}
-                                        }
-                                    }
+                                if first_byte == dhcp::v6::relay_fwd::RELAY_REPL {
+                                    handle_v6_server(
+                                        data, src, iface_name.clone(),
+                                        ctx.vss_enabled.then(|| ctx.vss_cfg.clone()),
+                                        &ctx.inner.stats, &transport,
+                                    ).await;
                                 } else if let Ok(msg) = v6::Message::decode(
                                     &mut dhcproto::Decoder::new(&data)
                                 ) {
-                                    // Client→Server: encapsulate in RELAY_FORW
                                     let is_client = matches!(
                                         msg.msg_type(),
                                         v6::MessageType::Solicit
@@ -410,54 +498,15 @@ impl RelayAgent {
                                             | v6::MessageType::InformationRequest
                                     );
 
-                                    if is_client && inner.config.dhcpv6.enable_interface_id {
-                                        let mut ctx = PipelineContext::new(
-                                            data,
-                                            src,
-                                            iface_name.clone(),
-                                        );
-
-                                        let link_addr = transport
-                                            .local_addr()
-                                            .map(|a| match a.ip() {
-                                                std::net::IpAddr::V6(ip) => ip,
-                                                _ => Ipv6Addr::UNSPECIFIED,
-                                            })
-                                            .unwrap_or(Ipv6Addr::UNSPECIFIED);
-
-                                        let server_addr = inner
-                                            .config
-                                            .dhcpv6
-                                            .server_addrs
-                                            .first()
-                                            .copied()
-                                            .unwrap_or(bind_addr);
-
-                                        let vss_cfg = if inner.config.dhcpv6.vss.enabled {
-                                            Some(inner.config.dhcpv6.vss.clone())
-                                        } else {
-                                            None
-                                        };
-
-                                        let mut pipeline = dhcp::v6::pipeline::Dhcpv6Pipeline::build_request(
-                                            iface_name.clone(),
-                                            inner.config.dhcpv6.remote_id.clone().unwrap_or_default(),
-                                            link_addr,
-                                            src,
-                                            server_addr,
-                                            vss_cfg,
-                                        );
-
-                                        match pipeline.execute(&mut ctx) {
-                                            Ok(true) => {
-                                                inner.stats.packets_forwarded.fetch_add(1, Ordering::Relaxed);
-                                                if let Some(dst) = ctx.dst_addr {
-                                                    let _ = transport.send_to(&ctx.buffer, dst).await;
-                                                }
-                                            }
-                                            Ok(false) => {}
-                                            Err(_) => {}
-                                        }
+                                    if is_client {
+                                        handle_v6_client(
+                                            data, src, iface_name.clone(),
+                                            ctx.remote_id.clone(), server_addr,
+                                            ctx.vss_enabled.then(|| ctx.vss_cfg.clone()),
+                                            ctx.enable_interface_id,
+                                            ctx.enable_remote_id,
+                                            &ctx.inner.stats, &transport,
+                                        ).await;
                                     }
                                 }
                             }
@@ -522,28 +571,12 @@ impl RelayAgent {
     }
 }
 
-impl RelayConfig {
-    /// Validate the configuration, returning an error if something is inconsistent.
-    pub fn validate(&self) -> Result<(), RelayError> {
-        if self.interfaces.is_empty() {
-            return Err(RelayError::Config("at least one interface is required".into()));
-        }
-        for iface in &self.interfaces {
-            if iface.name.is_empty() {
-                return Err(RelayError::Config("interface name cannot be empty".into()));
-            }
-        }
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config;
 
-    #[test]
-    fn relay_agent_new_defaults() {
+    fn test_config() -> RelayConfig {
         let mut cfg = RelayConfig::default();
         cfg.interfaces.push(config::InterfaceConfig {
             name: "eth0".into(),
@@ -551,7 +584,12 @@ mod tests {
             trusted: false,
             enabled: true,
         });
-        let agent = RelayAgent::new(cfg).unwrap();
+        cfg
+    }
+
+    #[test]
+    fn relay_agent_new_defaults() {
+        let agent = RelayAgent::new(test_config()).unwrap();
         assert_eq!(agent.stats().packets_received, 0);
     }
 
@@ -562,28 +600,14 @@ mod tests {
 
     #[test]
     fn stats_snapshot_reflects_counters() {
-        let mut cfg = RelayConfig::default();
-        cfg.interfaces.push(config::InterfaceConfig {
-            name: "eth0".into(),
-            ip_addr: "10.0.0.1".into(),
-            trusted: false,
-            enabled: true,
-        });
-        let agent = RelayAgent::new(cfg).unwrap();
+        let agent = RelayAgent::new(test_config()).unwrap();
         agent.stats_raw().packets_received.fetch_add(5, Ordering::Relaxed);
         assert_eq!(agent.stats().packets_received, 5);
     }
 
     #[test]
     fn shutdown_sets_signal() {
-        let mut cfg = RelayConfig::default();
-        cfg.interfaces.push(config::InterfaceConfig {
-            name: "eth0".into(),
-            ip_addr: "10.0.0.1".into(),
-            trusted: false,
-            enabled: true,
-        });
-        let agent = RelayAgent::new(cfg).unwrap();
+        let agent = RelayAgent::new(test_config()).unwrap();
         agent.shutdown();
     }
 
@@ -612,14 +636,7 @@ mod tests {
             }
         }
 
-        let mut cfg = RelayConfig::default();
-        cfg.interfaces.push(config::InterfaceConfig {
-            name: "eth0".into(),
-            ip_addr: "10.0.0.1".into(),
-            trusted: false,
-            enabled: true,
-        });
-        let mut agent = RelayAgent::new(cfg).unwrap();
+        let mut agent = RelayAgent::new(test_config()).unwrap();
 
         agent
             .with_topology_provider(Box::new(DummyTopology))

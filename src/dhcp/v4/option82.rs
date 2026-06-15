@@ -33,16 +33,6 @@ pub(crate) fn relay_info_to_sub_opt(info: &relay::RelayInfo) -> SubOption {
     }
 }
 
-/// Returns true if the DHCP packet appears to be IPsec-protected.
-///
-/// At the DHCP/UDP layer we cannot reliably detect IPsec AH/ESP headers
-/// (they live at the IP layer). This function always returns `false`.
-/// Callers that know a packet arrived via IPsec should skip Option 82
-/// processing before calling `insert` or `strip`.
-pub fn is_ipsec_protected(_msg: &v4::Message) -> bool {
-    false
-}
-
 /// Insert an Option 82 (Relay Agent Information) into the DHCPv4 message.
 ///
 /// At least one of `circuit_id` or `remote_id` must be provided. The option

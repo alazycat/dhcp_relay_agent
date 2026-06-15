@@ -2,6 +2,7 @@ use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use murmur3::murmur3_x64_128;
 
 use crate::error::{RelayError, RelayResult};
 
@@ -104,6 +105,31 @@ impl DpdCache {
     }
 }
 
+/// Compute an H-DPD key and Hash Assist Value from packet content.
+///
+/// Hashes `src || dst || payload[..min(64, len)]` using murmur3_x64_128 and
+/// returns the DPD key along with the lower 64 bits as the HAV.
+pub fn h_dpd_hash(src: IpAddr, dst: IpAddr, payload: &[u8]) -> (DpdKey, u64) {
+    let hash_len = 64.min(payload.len());
+
+    let mut input = Vec::with_capacity(32 + hash_len);
+    match src {
+        IpAddr::V4(ip) => input.extend_from_slice(&ip.octets()),
+        IpAddr::V6(ip) => input.extend_from_slice(&ip.octets()),
+    }
+    match dst {
+        IpAddr::V4(ip) => input.extend_from_slice(&ip.octets()),
+        IpAddr::V6(ip) => input.extend_from_slice(&ip.octets()),
+    }
+    input.extend_from_slice(&payload[..hash_len]);
+
+    let hash = murmur3_x64_128(&mut &input[..], 0)
+        .expect("murmur3 hash should not fail on in-memory data");
+    let packet_id = (hash & 0xFFFF_FFFF_FFFF_FFFF) as u64;
+
+    (DpdKey::new(src, dst, packet_id), packet_id)
+}
+
 /// Spawn a background task that periodically evicts expired DPD cache entries.
 ///
 /// The eviction interval is `window / 4`. Returns a `JoinHandle` that the caller
@@ -111,6 +137,10 @@ impl DpdCache {
 pub fn spawn_eviction_task(cache: std::sync::Arc<DpdCache>) -> tokio::task::JoinHandle<()> {
     let interval = cache.window / 4;
     if interval < Duration::from_secs(1) {
+        tracing::warn!(
+            window_secs = cache.window.as_secs(),
+            "DPD eviction interval too short — eviction disabled; entries will not expire"
+        );
         tokio::spawn(async {})
     } else {
         tokio::spawn(async move {

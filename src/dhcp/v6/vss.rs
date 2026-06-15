@@ -6,16 +6,11 @@ use crate::error::RelayError;
 /// DHCPv6 VSS option code (RFC 6607).
 pub const VSS_OPTION_CODE: u16 = 68;
 
-/// VSS type constants.
-const VSS_TYPE_NVT_ASCII: u8 = 0;
-const VSS_TYPE_RFC2685_VPN_ID: u8 = 1;
-const VSS_TYPE_GLOBAL: u8 = 255;
-
 /// Encode a DHCPv6 VSS option (code 68).
 ///
 /// Wire format: type(1) + info(variable)
 pub fn encode(vss: &VssConfig) -> Result<DhcpOption, RelayError> {
-    validate(vss)?;
+    vss.validate_vss()?;
 
     let mut data = Vec::with_capacity(1 + vss.vss_info.len());
     data.push(vss.vss_type);
@@ -45,34 +40,6 @@ pub fn extract(opts: &[DhcpOption]) -> Option<(u8, Vec<u8>)> {
         }
     }
     None
-}
-
-fn validate(vss: &VssConfig) -> Result<(), RelayError> {
-    match vss.vss_type {
-        VSS_TYPE_NVT_ASCII => {}
-        VSS_TYPE_RFC2685_VPN_ID => {
-            if vss.vss_info.len() != 7 {
-                return Err(RelayError::Config(format!(
-                    "VPN-ID (type 1) requires 7 bytes, got {}",
-                    vss.vss_info.len()
-                )));
-            }
-        }
-        VSS_TYPE_GLOBAL => {
-            if !vss.vss_info.is_empty() {
-                return Err(RelayError::Config(
-                    "Global VSS (type 255) requires empty vss_info".into(),
-                ));
-            }
-        }
-        _ => {
-            return Err(RelayError::Config(format!(
-                "unsupported VSS type: {}",
-                vss.vss_type
-            )));
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

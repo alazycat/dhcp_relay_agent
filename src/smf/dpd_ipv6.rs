@@ -1,8 +1,6 @@
 use std::net::IpAddr;
 
-use murmur3::murmur3_x64_128;
-
-use super::dpd::DpdKey;
+use super::dpd::{h_dpd_hash, DpdKey};
 use super::dpd_option::SmfDpdOption;
 
 /// Generate an I-DPD packet identifier for IPv6.
@@ -27,31 +25,9 @@ pub fn i_dpd_packet_id_from_raw(src: IpAddr, dst: IpAddr, identifier: u32) -> Dp
 
 /// Generate an H-DPD packet identifier for IPv6.
 ///
-/// Hashes `src_addr || dst_addr || payload[..min(64, len)]` using murmur3_x64_128.
 /// Returns the DPD key and the Hash Assist Value (lower 64 bits of hash).
-pub fn h_dpd_packet_id(
-    src: IpAddr,
-    dst: IpAddr,
-    payload: &[u8],
-) -> (DpdKey, u64) {
-    let hash_len = 64.min(payload.len());
-
-    let mut input = Vec::with_capacity(32 + hash_len);
-    match src {
-        IpAddr::V4(ip) => input.extend_from_slice(&ip.octets()),
-        IpAddr::V6(ip) => input.extend_from_slice(&ip.octets()),
-    }
-    match dst {
-        IpAddr::V4(ip) => input.extend_from_slice(&ip.octets()),
-        IpAddr::V6(ip) => input.extend_from_slice(&ip.octets()),
-    }
-    input.extend_from_slice(&payload[..hash_len]);
-
-    let hash = murmur3_x64_128(&mut &input[..], 0)
-        .expect("murmur3 hash should not fail on in-memory data");
-    let packet_id = (hash & 0xFFFF_FFFF_FFFF_FFFF) as u64;
-
-    (DpdKey::new(src, dst, packet_id), packet_id)
+pub fn h_dpd_packet_id(src: IpAddr, dst: IpAddr, payload: &[u8]) -> (DpdKey, u64) {
+    h_dpd_hash(src, dst, payload)
 }
 
 /// Check whether there was an H-DPD collision. If the HAV differs from the cached

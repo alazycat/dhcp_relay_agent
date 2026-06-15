@@ -3,8 +3,8 @@ use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use crate::error::RelayError;
 
 /// DHCPv6 message types.
-const RELAY_FORW: u8 = 12;
-const RELAY_REPL: u8 = 13;
+pub const RELAY_FORW: u8 = 12;
+pub const RELAY_REPL: u8 = 13;
 
 /// DHCPv6 option code for relay-message.
 const OPTION_RELAY_MSG: u16 = 9;

@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
+use crate::error::RelayError;
+
 /// Top-level configuration for the relay agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayConfig {
@@ -33,6 +35,27 @@ impl Default for RelayConfig {
             smf: SmfConfig::default(),
             max_packet_size: 1500,
         }
+    }
+}
+
+impl RelayConfig {
+    /// Validate the configuration, returning an error if something is inconsistent.
+    pub fn validate(&self) -> Result<(), RelayError> {
+        if self.interfaces.is_empty() {
+            return Err(RelayError::Config("at least one interface is required".into()));
+        }
+        for iface in &self.interfaces {
+            if iface.name.is_empty() {
+                return Err(RelayError::Config("interface name cannot be empty".into()));
+            }
+        }
+        if self.dhcpv4.vss.enabled {
+            self.dhcpv4.vss.validate_vss()?;
+        }
+        if self.dhcpv6.vss.enabled {
+            self.dhcpv6.vss.validate_vss()?;
+        }
+        Ok(())
     }
 }
 
@@ -119,6 +142,13 @@ impl Default for Dhcpv6Config {
     }
 }
 
+/// VSS type: NVT ASCII string (RFC 6607).
+pub const VSS_TYPE_NVT_ASCII: u8 = 0;
+/// VSS type: RFC 2685 VPN-ID (7-byte OUI + index).
+pub const VSS_TYPE_RFC2685_VPN_ID: u8 = 1;
+/// VSS type: Global/default (no subnet selection).
+pub const VSS_TYPE_GLOBAL: u8 = 255;
+
 /// Virtual Subnet Selection configuration (RFC 6607).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VssConfig {
@@ -139,11 +169,61 @@ impl Default for VssConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            vss_type: 255,
+            vss_type: VSS_TYPE_GLOBAL,
             vss_info: Vec::new(),
             vpn_name: None,
         }
     }
+}
+
+impl VssConfig {
+    /// Validate VSS type and info constraints (RFC 6607).
+    pub fn validate_vss(&self) -> Result<(), RelayError> {
+        match self.vss_type {
+            VSS_TYPE_NVT_ASCII => {}
+            VSS_TYPE_RFC2685_VPN_ID => {
+                if self.vss_info.len() != 7 {
+                    return Err(RelayError::Config(format!(
+                        "VPN-ID (type 1) requires exactly 7 bytes, got {}",
+                        self.vss_info.len()
+                    )));
+                }
+            }
+            VSS_TYPE_GLOBAL => {
+                if !self.vss_info.is_empty() {
+                    return Err(RelayError::Config(
+                        "Global VSS (type 255) requires empty vss_info".into(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(RelayError::Config(format!(
+                    "unsupported VSS type: {}",
+                    self.vss_type
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// SMF (Simplified Multicast Forwarding) DPD mode (RFC 6621).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum DpdMode {
+    /// Identifier-based DPD.
+    #[default]
+    IDpd,
+    /// Hash-based DPD.
+    HDpd,
+}
+
+/// Hash function for H-DPD.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum HashFunction {
+    /// MurmurHash3 x64 128-bit.
+    #[default]
+    Murmur3,
 }
 
 /// SMF (Simplified Multicast Forwarding) configuration (RFC 6621).
@@ -155,24 +235,16 @@ pub struct SmfConfig {
     /// DPD cache entry time-to-live in seconds.
     #[serde(default = "default_dpd_window_secs")]
     pub dpd_window_secs: u64,
-    /// DPD mode: "i-dpd" or "h-dpd".
-    #[serde(default = "default_dpd_mode")]
-    pub dpd_mode: String,
-    /// Hash function for H-DPD: "murmur3" only for now.
-    #[serde(default = "default_hash_fn")]
-    pub hash_function: String,
+    /// DPD mode.
+    #[serde(default)]
+    pub dpd_mode: DpdMode,
+    /// Hash function for H-DPD.
+    #[serde(default)]
+    pub hash_function: HashFunction,
 }
 
 fn default_dpd_window_secs() -> u64 {
     10
-}
-
-fn default_dpd_mode() -> String {
-    "i-dpd".to_string()
-}
-
-fn default_hash_fn() -> String {
-    "murmur3".to_string()
 }
 
 impl Default for SmfConfig {
@@ -180,8 +252,8 @@ impl Default for SmfConfig {
         Self {
             enabled: false,
             dpd_window_secs: 10,
-            dpd_mode: "i-dpd".to_string(),
-            hash_function: "murmur3".to_string(),
+            dpd_mode: DpdMode::default(),
+            hash_function: HashFunction::default(),
         }
     }
 }

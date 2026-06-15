@@ -1,20 +1,26 @@
 use crate::config::VssConfig;
 use crate::error::RelayError;
 
+// Re-export centralized VSS type constants from config for convenience.
+pub use crate::config::{VSS_TYPE_GLOBAL, VSS_TYPE_NVT_ASCII, VSS_TYPE_RFC2685_VPN_ID};
+
 /// VSS sub-option codes inside Option 82 (RFC 6607).
 pub const VSS_SUBOPT_CODE: u8 = 151;
 pub const VSS_CONTROL_SUBOPT_CODE: u8 = 152;
 
-/// VSS type constants.
-pub const VSS_TYPE_NVT_ASCII: u8 = 0;
-pub const VSS_TYPE_RFC2685_VPN_ID: u8 = 1;
-pub const VSS_TYPE_GLOBAL: u8 = 255;
+/// Byte offset into an encoded sub-option TLV where the value begins
+/// (skipping the 1-byte code and 1-byte length fields).
+pub const SUBOPT_HEADER_LEN: usize = 2;
+
+/// Byte offset into VSS sub-option value where the VSS info payload begins
+/// (skipping the 1-byte VSS type field).
+pub const VSS_TYPE_OFFSET: usize = 1;
 
 /// Encode VSS + VSS-Control as raw sub-option bytes for insertion into Option 82.
 ///
 /// Returns (vss_bytes, vss_control_bytes) — each is a complete sub-option TLV.
 pub fn encode_sub_opts(vss: &VssConfig) -> Result<(Vec<u8>, Vec<u8>), RelayError> {
-    validate_vss_config(vss)?;
+    vss.validate_vss()?;
 
     // VSS sub-option (151): code(1) + len(1) + type(1) + info(variable)
     let mut vss_opt = Vec::with_capacity(3 + vss.vss_info.len());
@@ -44,37 +50,6 @@ pub fn check_server_support(sub_opts_raw: &[u8]) -> bool {
         pos += 2 + len;
     }
     true // No VSS-Control found → server supports VSS
-}
-
-/// Validate VSS configuration constraints.
-fn validate_vss_config(vss: &VssConfig) -> Result<(), RelayError> {
-    match vss.vss_type {
-        VSS_TYPE_NVT_ASCII => {
-            // NVT ASCII: any length is valid
-        }
-        VSS_TYPE_RFC2685_VPN_ID => {
-            if vss.vss_info.len() != 7 {
-                return Err(RelayError::Config(format!(
-                    "VPN-ID (type 1) requires exactly 7 bytes, got {}",
-                    vss.vss_info.len()
-                )));
-            }
-        }
-        VSS_TYPE_GLOBAL => {
-            if !vss.vss_info.is_empty() {
-                return Err(RelayError::Config(
-                    "Global VSS (type 255) requires empty vss_info".into(),
-                ));
-            }
-        }
-        _ => {
-            return Err(RelayError::Config(format!(
-                "unsupported VSS type: {}",
-                vss.vss_type
-            )));
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

@@ -1,7 +1,10 @@
 use std::io;
 use std::net::SocketAddr;
 
+use async_trait::async_trait;
 use tokio::net::UdpSocket;
+
+use super::Transport;
 
 pub struct UdpTransport {
     socket: UdpSocket,
@@ -28,5 +31,20 @@ impl UdpTransport {
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
+    }
+}
+
+#[async_trait]
+impl Transport for UdpTransport {
+    async fn recv_from(&mut self) -> io::Result<(Vec<u8>, SocketAddr)> {
+        UdpTransport::recv_from(self).await
+    }
+
+    async fn send_to(&self, buf: &[u8], dst: SocketAddr) -> io::Result<usize> {
+        UdpTransport::send_to(self, buf, dst).await
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        UdpTransport::local_addr(self)
     }
 }

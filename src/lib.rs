@@ -241,6 +241,49 @@ impl RelayAgent {
                                                 inner.stats.packets_dropped_spoof.fetch_add(1, Ordering::Relaxed);
                                             }
                                         }
+                                    } else if !is_client && inner.config.dhcpv4.enable_option82 {
+                                        // Server→Client reply: extract echoed Option 82,
+                                        // strip it with echo validation, and forward to client.
+                                        let expected_sub_opts = msg
+                                            .opts()
+                                            .get(v4::OptionCode::RelayAgentInformation)
+                                            .and_then(|opt| {
+                                                if let v4::DhcpOption::RelayAgentInformation(info) = opt {
+                                                    Some(
+                                                        info.iter()
+                                                            .map(|(_, ri)| {
+                                                                dhcp::v4::option82::relay_info_to_sub_opt(ri)
+                                                            })
+                                                            .collect::<Vec<_>>(),
+                                                    )
+                                                } else {
+                                                    None
+                                                }
+                                            });
+
+                                        let mut ctx = PipelineContext::new(
+                                            data,
+                                            src,
+                                            iface_name.clone(),
+                                        );
+
+                                        let mut pipeline = dhcp::v4::pipeline::Dhcpv4Pipeline::build_reply(
+                                            expected_sub_opts,
+                                        );
+
+                                        match pipeline.execute(&mut ctx) {
+                                            Ok(true) => {
+                                                inner.stats.packets_forwarded.fetch_add(1, Ordering::Relaxed);
+                                                inner.stats.option82_stripped.fetch_add(1, Ordering::Relaxed);
+                                                if let Some(dst) = ctx.dst_addr {
+                                                    let _ = transport.send_to(&ctx.buffer, dst).await;
+                                                }
+                                            }
+                                            Ok(false) => {}
+                                            Err(_) => {
+                                                // Option82 echo mismatch or parse error — drop
+                                            }
+                                        }
                                     }
                                 }
                             }

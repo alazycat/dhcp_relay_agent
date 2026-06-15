@@ -1,4 +1,4 @@
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use dhcproto::{v4, Decodable, Encodable};
 
@@ -225,6 +225,33 @@ impl PipelineStage for ForwardStage {
     }
 }
 
+// ── ReplyAddrStage ────────────────────────────────────────────────────────
+
+/// Resolves the client address from the server reply (RFC 2131).
+///
+/// Priority: ciaddr → broadcast 255.255.255.255:68
+struct ReplyAddrStage;
+
+impl PipelineStage for ReplyAddrStage {
+    fn name(&self) -> &str {
+        "dhcpv4::reply_addr"
+    }
+
+    fn process(&self, ctx: &mut PipelineContext) -> RelayResult<bool> {
+        let msg = v4::Message::decode(&mut dhcproto::Decoder::new(&ctx.buffer))
+            .map_err(|e| RelayError::Parse(format!("reply_addr decode: {e}")))?;
+
+        let client = if msg.ciaddr() != Ipv4Addr::UNSPECIFIED {
+            SocketAddr::new(IpAddr::V4(msg.ciaddr()), 68)
+        } else {
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)), 68)
+        };
+
+        ctx.dst_addr = Some(client);
+        Ok(true)
+    }
+}
+
 // ── Dhcpv4Pipeline ────────────────────────────────────────────────────────
 
 /// Builder for DHCPv4 request and reply processing pipelines.
@@ -256,15 +283,14 @@ impl Dhcpv4Pipeline {
 
     /// Build the server→client (reply relay) pipeline.
     ///
-    /// Stages: Parse → Validate(echo) → Option82(strip) → Forward
+    /// Stages: Parse → Option82(strip+echo check) → ReplyAddr(resolve) → Forward
     pub fn build_reply(
         expected_sub_opts: Option<Vec<option82::SubOption>>,
-        client_addr: SocketAddr,
     ) -> Pipeline {
         let stages: Vec<Box<dyn PipelineStage>> = vec![
             Box::new(ParseStage),
             Box::new(Option82StripStage { expected_sub_opts }),
-            Box::new(ForwardStage { dest: client_addr }),
+            Box::new(ReplyAddrStage),
         ];
         Pipeline::with_stages(stages)
     }
@@ -365,9 +391,8 @@ mod tests {
         msg.encode(&mut dhcproto::Encoder::new(&mut buf)).unwrap();
 
         let expected = vec![option82::SubOption::new(1, b"eth0".to_vec())];
-        let client = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 68);
 
-        let mut pipeline = Dhcpv4Pipeline::build_reply(Some(expected), client);
+        let mut pipeline = Dhcpv4Pipeline::build_reply(Some(expected));
 
         let mut ctx = client_context();
         ctx.buffer = buf;
@@ -380,8 +405,11 @@ mod tests {
             v4::Message::decode(&mut dhcproto::Decoder::new(&ctx.buffer)).unwrap();
         assert!(!msg.opts().contains(v4::OptionCode::RelayAgentInformation));
 
-        // Verify destination is the client
-        assert_eq!(ctx.dst_addr, Some(client));
+        // Verify destination is broadcast (ciaddr was 0)
+        assert_eq!(
+            ctx.dst_addr,
+            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)), 68))
+        );
     }
 
     #[test]
@@ -400,9 +428,8 @@ mod tests {
 
         // Expected is different from what server echoed
         let expected = vec![option82::SubOption::new(1, b"eth0".to_vec())];
-        let client = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 68);
 
-        let mut pipeline = Dhcpv4Pipeline::build_reply(Some(expected), client);
+        let mut pipeline = Dhcpv4Pipeline::build_reply(Some(expected));
 
         let mut ctx = client_context();
         ctx.buffer = buf;

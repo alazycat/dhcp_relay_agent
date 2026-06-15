@@ -81,6 +81,10 @@ struct Inner {
     config: RelayConfig,
     stats: RelayStats,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
+    #[cfg(feature = "smf")]
+    topology_provider: std::sync::Mutex<Option<Box<dyn TopologyProvider>>>,
+    #[cfg(feature = "smf")]
+    relay_selector: std::sync::Mutex<Option<Box<dyn RelaySetSelector>>>,
 }
 
 /// Top-level relay agent handle.
@@ -102,6 +106,10 @@ impl RelayAgent {
                 config,
                 stats: RelayStats::default(),
                 shutdown_tx,
+                #[cfg(feature = "smf")]
+                topology_provider: std::sync::Mutex::new(None),
+                #[cfg(feature = "smf")]
+                relay_selector: std::sync::Mutex::new(None),
             }),
         })
     }
@@ -262,14 +270,46 @@ impl RelayAgent {
 
     /// Inject a custom topology provider for SMF neighbor discovery.
     #[cfg(feature = "smf")]
-    pub fn with_topology_provider(&mut self, _provider: Box<dyn TopologyProvider>) -> &mut Self {
+    pub fn with_topology_provider(&mut self, provider: Box<dyn TopologyProvider>) -> &mut Self {
+        *self
+            .inner
+            .topology_provider
+            .lock()
+            .expect("topology_provider mutex poisoned") = Some(provider);
         self
     }
 
     /// Inject a custom relay set selector for SMF.
     #[cfg(feature = "smf")]
-    pub fn with_relay_selector(&mut self, _selector: Box<dyn RelaySetSelector>) -> &mut Self {
+    pub fn with_relay_selector(&mut self, selector: Box<dyn RelaySetSelector>) -> &mut Self {
+        *self
+            .inner
+            .relay_selector
+            .lock()
+            .expect("relay_selector mutex poisoned") = Some(selector);
         self
+    }
+
+    /// Take the injected topology provider for consumption by SMF engine.
+    #[cfg(feature = "smf")]
+    #[allow(dead_code)] // consumed by SMF integration (v0.3)
+    pub(crate) fn take_topology_provider(&self) -> Option<Box<dyn TopologyProvider>> {
+        self.inner
+            .topology_provider
+            .lock()
+            .expect("topology_provider mutex poisoned")
+            .take()
+    }
+
+    /// Take the injected relay set selector for consumption by SMF engine.
+    #[cfg(feature = "smf")]
+    #[allow(dead_code)] // consumed by SMF integration (v0.3)
+    pub(crate) fn take_relay_selector(&self) -> Option<Box<dyn RelaySetSelector>> {
+        self.inner
+            .relay_selector
+            .lock()
+            .expect("relay_selector mutex poisoned")
+            .take()
     }
 }
 
@@ -336,5 +376,50 @@ mod tests {
         });
         let agent = RelayAgent::new(cfg).unwrap();
         agent.shutdown();
+    }
+
+    #[cfg(feature = "smf")]
+    #[test]
+    fn smf_trait_injection_stores_and_retrieves() {
+        use std::net::IpAddr;
+
+        struct DummyTopology;
+        impl TopologyProvider for DummyTopology {
+            fn neighbors(&self, _iface: &str) -> Vec<IpAddr> {
+                vec![]
+            }
+        }
+
+        struct DummySelector;
+        impl RelaySetSelector for DummySelector {
+            fn should_forward(
+                &self,
+                _ingress: &str,
+                _prev: IpAddr,
+                _src: IpAddr,
+                _dst: IpAddr,
+            ) -> bool {
+                false
+            }
+        }
+
+        let mut cfg = RelayConfig::default();
+        cfg.interfaces.push(config::InterfaceConfig {
+            name: "eth0".into(),
+            ip_addr: "10.0.0.1".into(),
+            trusted: false,
+            enabled: true,
+        });
+        let mut agent = RelayAgent::new(cfg).unwrap();
+
+        agent
+            .with_topology_provider(Box::new(DummyTopology))
+            .with_relay_selector(Box::new(DummySelector));
+
+        assert!(agent.take_topology_provider().is_some());
+        assert!(agent.take_relay_selector().is_some());
+
+        // Second take returns None (already consumed)
+        assert!(agent.take_topology_provider().is_none());
     }
 }

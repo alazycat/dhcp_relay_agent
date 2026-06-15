@@ -299,11 +299,149 @@ impl RelayAgent {
     }
 
     /// Spawn DHCPv6 relay tasks — one per interface on port 547.
-    /// Placeholder: full implementation in issue #3.
     #[cfg(feature = "dhcpv6")]
     async fn spawn_v6_tasks(&self) -> RelayResult<Vec<tokio::task::JoinHandle<()>>> {
-        let _ = self.inner.shutdown_tx.subscribe();
-        Ok(Vec::new())
+        use std::net::Ipv6Addr;
+
+        use dhcproto::{v6, Decodable};
+        use pipeline::PipelineContext;
+
+        let mut handles = Vec::new();
+        let shutdown_rx = self.inner.shutdown_tx.subscribe();
+        let inner = self.inner.clone();
+
+        for iface in &self.inner.config.interfaces {
+            if !iface.enabled {
+                continue;
+            }
+
+            // Parse the interface IP, replacing port with 547 for DHCPv6
+            let iface_ip_str = iface.ip_addr.split(':').next().unwrap_or("::");
+            let bind_addr: std::net::SocketAddr = format!("{iface_ip_str}:547")
+                .parse()
+                .map_err(|e| RelayError::Config(format!("invalid v6 IP: {e}")))?;
+
+            let mut transport = transport::udp::UdpTransport::bind(bind_addr)
+                .await
+                .map_err(|e| RelayError::Transport(format!("v6 bind: {e}")))?;
+
+            let iface_name = iface.name.clone();
+            let inner = inner.clone();
+            let mut sr = shutdown_rx.clone();
+
+            let handle = tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = sr.changed() => {
+                            if *sr.borrow() {
+                                break;
+                            }
+                        }
+                        result = transport.recv_from() => {
+                            if let Ok((data, src)) = result {
+                                inner.stats.packets_received.fetch_add(1, Ordering::Relaxed);
+
+                                // Determine direction: check first byte for RELAY_REPL (13)
+                                // vs client-originated message types (1=SOLICIT, 3=REQ, etc.)
+                                let first_byte = data.first().copied().unwrap_or(0);
+
+                                if first_byte == 13 {
+                                    // Server→Client RELAY_REPL: decapsulate and forward
+                                    if inner.config.dhcpv6.enable_interface_id {
+                                        let mut ctx = PipelineContext::new(
+                                            data,
+                                            src,
+                                            iface_name.clone(),
+                                        );
+
+                                        // Forward to the original client peer
+                                        let client_addr = src; // reply goes back to client from recv interface
+
+                                        let mut pipeline = dhcp::v6::pipeline::Dhcpv6Pipeline::build_reply(
+                                            client_addr,
+                                        );
+
+                                        match pipeline.execute(&mut ctx) {
+                                            Ok(true) => {
+                                                inner.stats.packets_forwarded.fetch_add(1, Ordering::Relaxed);
+                                                if let Some(dst) = ctx.dst_addr {
+                                                    let _ = transport.send_to(&ctx.buffer, dst).await;
+                                                }
+                                            }
+                                            Ok(false) => {}
+                                            Err(_) => {}
+                                        }
+                                    }
+                                } else if let Ok(msg) = v6::Message::decode(
+                                    &mut dhcproto::Decoder::new(&data)
+                                ) {
+                                    // Client→Server: encapsulate in RELAY_FORW
+                                    let is_client = matches!(
+                                        msg.msg_type(),
+                                        v6::MessageType::Solicit
+                                            | v6::MessageType::Request
+                                            | v6::MessageType::Confirm
+                                            | v6::MessageType::Renew
+                                            | v6::MessageType::Rebind
+                                            | v6::MessageType::Decline
+                                            | v6::MessageType::Release
+                                            | v6::MessageType::InformationRequest
+                                    );
+
+                                    if is_client && inner.config.dhcpv6.enable_interface_id {
+                                        let mut ctx = PipelineContext::new(
+                                            data,
+                                            src,
+                                            iface_name.clone(),
+                                        );
+
+                                        let link_addr = transport
+                                            .local_addr()
+                                            .map(|a| match a.ip() {
+                                                std::net::IpAddr::V6(ip) => ip,
+                                                _ => Ipv6Addr::UNSPECIFIED,
+                                            })
+                                            .unwrap_or(Ipv6Addr::UNSPECIFIED);
+
+                                        let server_addr = inner
+                                            .config
+                                            .dhcpv6
+                                            .server_addrs
+                                            .first()
+                                            .copied()
+                                            .unwrap_or(bind_addr);
+
+                                        let mut pipeline = dhcp::v6::pipeline::Dhcpv6Pipeline::build_request(
+                                            iface_name.clone(),
+                                            inner.config.dhcpv6.remote_id.clone().unwrap_or_default(),
+                                            link_addr,
+                                            src,
+                                            server_addr,
+                                        );
+
+                                        match pipeline.execute(&mut ctx) {
+                                            Ok(true) => {
+                                                inner.stats.packets_forwarded.fetch_add(1, Ordering::Relaxed);
+                                                if let Some(dst) = ctx.dst_addr {
+                                                    let _ = transport.send_to(&ctx.buffer, dst).await;
+                                                }
+                                            }
+                                            Ok(false) => {}
+                                            Err(_) => {}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        Ok(handles)
     }
 
     /// Signal the relay agent to shut down gracefully.

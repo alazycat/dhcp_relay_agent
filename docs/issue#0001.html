@@ -6,122 +6,71 @@
   <title>Implementation Notes — Issue #1</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-      background: #FAF9F6;
-      color: #1a1a1a;
-      padding: 2.5rem 2rem;
-      line-height: 1.7;
-    }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #FAF9F6; color: #1a1a1a; padding: 2.5rem 2rem; line-height: 1.7; }
     .container { max-width: 800px; margin: 0 auto; }
     h1 { font-size: 1.375rem; font-weight: 700; margin-bottom: 0.25rem; }
     .meta { color: #8B8680; font-size: 0.8125rem; margin-bottom: 2rem; }
-    h2 {
-      font-size: 1rem;
-      font-weight: 600;
-      margin-top: 2rem;
-      margin-bottom: 0.75rem;
-      padding-bottom: 0.375rem;
-      border-bottom: 1px solid #E8E4DE;
-      display: flex; align-items: center; gap: 0.5rem;
-    }
-    .dot {
-      width: 8px; height: 8px; border-radius: 50%; display: inline-block;
-    }
+    h2 { font-size: 1rem; font-weight: 600; margin-top: 2rem; margin-bottom: 0.75rem; padding-bottom: 0.375rem; border-bottom: 1px solid #E8E4DE; display: flex; align-items: center; gap: 0.5rem; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
     .dot.design { background: #5B8A72; }
     .dot.deviation { background: #D97757; }
     .dot.tradeoff { background: #4A6FA5; }
     .dot.question { background: #D4A843; }
-    .item {
-      background: #FFFFFF;
-      border: 1px solid #E8E4DE;
-      border-radius: 8px;
-      padding: 1rem 1.25rem;
-      margin-bottom: 0.75rem;
-      box-shadow: 0 1px 3px rgba(0,0,0,0.03);
-    }
+    .item { background: #FFFFFF; border: 1px solid #E8E4DE; border-radius: 8px; padding: 1rem 1.25rem; margin-bottom: 0.75rem; box-shadow: 0 1px 3px rgba(0,0,0,0.03); }
     .item h3 { font-size: 0.875rem; font-weight: 600; margin-bottom: 0.375rem; }
     .item p { font-size: 0.8125rem; color: #4A4540; margin-bottom: 0.375rem; }
-    .label {
-      display: inline-block;
-      font-size: 0.6875rem;
-      font-weight: 500;
-      padding: 0.125rem 0.5rem;
-      border-radius: 4px;
-      margin-right: 0.375rem;
-    }
+    .label { display: inline-block; font-size: 0.6875rem; font-weight: 500; padding: 0.125rem 0.5rem; border-radius: 4px; margin-right: 0.375rem; }
     .label-design { background: #F5F8F6; color: #5B8A72; border: 1px solid #5B8A72; }
     .label-deviation { background: #FFF5F0; color: #D97757; border: 1px solid #D97757; }
     .label-tradeoff { background: #F0F4F8; color: #4A6FA5; border: 1px solid #4A6FA5; }
     .label-question { background: #FDF8F0; color: #D4A843; border: 1px solid #D4A843; }
     .none { color: #B0AAA4; font-style: italic; font-size: 0.8125rem; }
-    .footer {
-      text-align: center; margin-top: 2.5rem; color: #B0AAA4;
-      font-size: 0.6875rem;
-    }
+    .footer { text-align: center; margin-top: 2.5rem; color: #B0AAA4; font-size: 0.6875rem; }
   </style>
 </head>
 <body>
   <div class="container">
     <h1>Implementation Notes</h1>
-    <p class="meta">Issue #1 &mdash; Project Foundation &amp; Core Framework &mdash; 2026-06-14</p>
+    <p class="meta">Issue <a href="https://github.com/alazycat/dhcp_relay_agent/issues/1">#1</a> &mdash; run() refactor: spawn_v4_tasks() / spawn_v6_tasks() &mdash; 2026-06-15</p>
 
     <h2><span class="dot design"></span> Design Decisions</h2>
 
     <div class="item">
-      <h3><span class="label label-design">Decision</span> PipelineStage uses Box&lt;dyn&gt; dynamic dispatch</h3>
-      <p><strong>Ambiguity:</strong> Spec said "PipelineStage trait objects" without specifying ownership model.</p>
-      <p><strong>Choice:</strong> <code>Vec&lt;Box&lt;dyn PipelineStage&gt;&gt;</code> — Pipeline owns all stages.</p>
-      <p><strong>Rationale:</strong> No shared ownership needed between pipelines; Box is simpler and avoids Arc ref-count overhead. If shared stages are needed later, the caller can wrap in Arc externally.</p>
+      <h3><span class="label label-design">Decision</span> Private helpers with #[cfg] instead of trait-based handlers</h3>
+      <p><strong>Ambiguity:</strong> SPEC §4.2 proposed internal helpers; could also use trait-based <code>RelayHandler</code> pattern.</p>
+      <p><strong>Choice:</strong> <code>#[cfg(feature)]</code> private methods on <code>RelayAgent</code> — <code>spawn_v4_tasks()</code> and <code>spawn_v6_tasks()</code>.</p>
+      <p><strong>Rationale:</strong> Trait-based handler adds ~30 lines of abstraction with no immediate value. cfg-gated methods are 3 dispatch lines in <code>run()</code>. Trait approach deferred to v0.3 relay-core.</p>
     </div>
 
     <div class="item">
-      <h3><span class="label label-design">Decision</span> RelayStats uses AtomicU64 directly</h3>
-      <p><strong>Ambiguity:</strong> Spec listed counter fields but not the concurrency primitive.</p>
-      <p><strong>Choice:</strong> <code>AtomicU64</code> fields on <code>RelayStats</code> with a <code>snapshot()</code> method returning a plain struct.</p>
-      <p><strong>Rationale:</strong> Zero dependencies, lock-free, sufficient for an embedded library. Callers can wrap with their metrics system (Prometheus, etc.) using the snapshot API.</p>
+      <h3><span class="label label-design">Decision</span> v6 stub returns empty instead of blocking</h3>
+      <p><strong>Choice:</strong> <code>spawn_v6_tasks()</code> subscribes to shutdown (validates channel) but returns <code>Ok(Vec::new())</code> immediately.</p>
+      <p><strong>Rationale:</strong> Blocking in a stub would prevent v4 from running when dhcpv6 is accidentally enabled. Empty return is safe and lets issue #3 drop in without changes to <code>run()</code>.</p>
     </div>
 
     <h2><span class="dot deviation"></span> Deviations</h2>
 
     <div class="item">
-      <h3><span class="label label-deviation">Deviation</span> dhcproto feature mapping removed</h3>
-      <p><strong>Spec said:</strong> <code>dhcpv4 = ["dhcproto/v4"]</code>, <code>dhcpv6 = ["dhcproto/v6"]</code>.</p>
-      <p><strong>Implemented:</strong> <code>dhcpv4 = []</code>, <code>dhcpv6 = []</code> — no dhcproto sub-features enabled.</p>
-      <p><strong>Why:</strong> dhcproto v0.14 has no <code>v4</code> or <code>v6</code> Cargo features — only <code>default</code> and <code>serde</code>. The v4/v6 types are always available in the crate; compile-time gating is handled entirely by our feature flags.</p>
-    </div>
-
-    <div class="item">
-      <h3><span class="label label-deviation">Deviation</span> socket2 resolves to v0.5, v0.6 also present</h3>
-      <p><strong>Spec said:</strong> <code>socket2 = "0.5"</code>.</p>
-      <p><strong>Implemented:</strong> socket2 v0.5.10 for our direct dependency; tokio pulls v0.6.4 as a transitive dep in test profile. Both compatible.</p>
-      <p><strong>Why:</strong> No action needed — Cargo resolves both versions. Upgrade to 0.6 when tokio stabilizes on it.</p>
+      <h3><span class="label label-deviation">Deviation</span> Removed dual-#[cfg] run() pattern</h3>
+      <p><strong>Old code:</strong> Two <code>run()</code> methods gated with <code>#[cfg(feature = "dhcpv4")]</code> / <code>#[cfg(not(...))]</code>.</p>
+      <p><strong>New code:</strong> Single unified <code>run()</code> with internal <code>#[cfg]</code> blocks. When no protocol features enabled, returns immediately.</p>
+      <p><strong>Why:</strong> Dual signatures with combinational cfg gates don't scale. Internal dispatch adds one cfg block per protocol — linear scaling.</p>
     </div>
 
     <h2><span class="dot tradeoff"></span> Tradeoffs</h2>
 
     <div class="item">
-      <h3><span class="label label-tradeoff">Tradeoff</span> RelayConfig::validate() vs builder pattern</h3>
-      <p><strong>Alternatives:</strong> (A) <code>RelayConfigBuilder</code> with <code>.build() -> Result</code> pattern; (B) plain struct with <code>validate()</code> post-hoc.</p>
-      <p><strong>Chose B:</strong> Simpler API, fewer types. The config is typically deserialized from JSON/YAML and validated once at startup. A builder adds ceremony for no gain in this use case.</p>
-    </div>
-
-    <div class="item">
-      <h3><span class="label label-tradeoff">Tradeoff</span> Pipeline::execute() returns Result&lt;bool&gt; vs separate halt enum</h3>
-      <p><strong>Alternatives:</strong> (A) <code>Result&lt;PipelineOutcome&gt;</code> enum with Forward/Drop variants; (B) <code>Result&lt;bool&gt;</code>.</p>
-      <p><strong>Chose B:</strong> <code>Ok(false)</code> for drop, <code>Ok(true)</code> for continue. The bool is unambiguous per the spec and avoids an extra type. An enum could be introduced later without breaking API changes if needed.</p>
+      <h3><span class="label label-tradeoff">Tradeoff</span> Immediate return vs blocking when no features enabled</h3>
+      <p><strong>Alternatives:</strong> (A) Subscribe to shutdown and block; (B) Return immediately.</p>
+      <p><strong>Chose B:</strong> Zero tasks = nothing to do. Blocking would be confusing behavior for callers.</p>
+      <p><strong>Downside:</strong> Callers expecting unconditional block must handle immediate return. Mitigated: dhcpv4 is the default feature; edge case only triggers with explicit <code>default-features = false</code>.</p>
     </div>
 
     <h2><span class="dot question"></span> Open Questions</h2>
 
     <div class="item">
-      <h3><span class="label label-question">Question</span> Should we upgrade dhcproto to v0.15?</h3>
-      <p>dhcproto v0.15.0 is available (we locked to v0.14.0 per SPEC). The diff may include API changes that affect downstream issues #2–#6. Review before upgrading.</p>
-    </div>
-
-    <div class="item">
-      <h3><span class="label label-question">Question</span> Future: re-add dhcproto feature mapping?</h3>
-      <p>If a future dhcproto version adds <code>v4</code>/<code>v6</code> Cargo features, should we map our features to theirs? This would reduce binary size by excluding unused protocol code. Track dhcproto releases.</p>
+      <h3><span class="label label-question">Question</span> v6 stub requires dhcpv6 feature + dhcproto/v6?</h3>
+      <p>The <code>spawn_v6_tasks</code> stub is gated behind <code>#[cfg(feature = "dhcpv6")]</code> which activates <code>dhcp/v6</code> module. Verify <code>cargo build --features dhcpv6</code> compiles correctly when dhcproto v6 feature is aligned — current Cargo.toml does not propagate v6 to dhcproto.</p>
     </div>
 
     <p class="footer">Generated by goal-workflow /note-it</p>

@@ -125,8 +125,25 @@ impl RelayAgent {
     ///
     /// Binds UDP sockets on each configured interface and processes incoming
     /// DHCP packets. Blocks until [`shutdown`](Self::shutdown) is called.
-    #[cfg(feature = "dhcpv4")]
     pub async fn run(&self) -> RelayResult<()> {
+        let mut handles = Vec::new();
+
+        #[cfg(feature = "dhcpv4")]
+        handles.extend(self.spawn_v4_tasks().await?);
+
+        #[cfg(feature = "dhcpv6")]
+        handles.extend(self.spawn_v6_tasks().await?);
+
+        for handle in handles {
+            let _ = handle.await;
+        }
+
+        Ok(())
+    }
+
+    /// Spawn DHCPv4 relay tasks — one per interface on port 67.
+    #[cfg(feature = "dhcpv4")]
+    async fn spawn_v4_tasks(&self) -> RelayResult<Vec<tokio::task::JoinHandle<()>>> {
         use std::net::Ipv4Addr;
 
         use dhcproto::{v4, Decodable};
@@ -227,18 +244,15 @@ impl RelayAgent {
             handles.push(handle);
         }
 
-        for handle in handles {
-            let _ = handle.await;
-        }
-
-        Ok(())
+        Ok(handles)
     }
 
-    /// Stub run() when dhcpv4 is not enabled.
-    #[cfg(not(feature = "dhcpv4"))]
-    pub async fn run(&self) -> RelayResult<()> {
-        let _ = self.inner.shutdown_tx.subscribe().changed().await;
-        Ok(())
+    /// Spawn DHCPv6 relay tasks — one per interface on port 547.
+    /// Placeholder: full implementation in issue #3.
+    #[cfg(feature = "dhcpv6")]
+    async fn spawn_v6_tasks(&self) -> RelayResult<Vec<tokio::task::JoinHandle<()>>> {
+        let _ = self.inner.shutdown_tx.subscribe();
+        Ok(Vec::new())
     }
 
     /// Signal the relay agent to shut down gracefully.

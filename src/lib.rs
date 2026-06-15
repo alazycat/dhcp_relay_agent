@@ -502,7 +502,7 @@ impl RelayAgent {
     /// Take the injected topology provider for consumption by SMF engine.
     #[cfg(feature = "smf")]
     #[allow(dead_code)] // consumed by SMF integration (v0.3)
-    pub(crate) fn take_topology_provider(&self) -> Option<Box<dyn TopologyProvider>> {
+    pub fn take_topology_provider(&self) -> Option<Box<dyn TopologyProvider>> {
         self.inner
             .topology_provider
             .lock()
@@ -513,7 +513,7 @@ impl RelayAgent {
     /// Take the injected relay set selector for consumption by SMF engine.
     #[cfg(feature = "smf")]
     #[allow(dead_code)] // consumed by SMF integration (v0.3)
-    pub(crate) fn take_relay_selector(&self) -> Option<Box<dyn RelaySetSelector>> {
+    pub fn take_relay_selector(&self) -> Option<Box<dyn RelaySetSelector>> {
         self.inner
             .relay_selector
             .lock()

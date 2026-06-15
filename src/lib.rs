@@ -221,12 +221,19 @@ impl RelayAgent {
                                             .filter_map(|i| i.ip_addr.split(':').next()?.parse().ok())
                                             .collect();
 
+                                        let vss_cfg = if inner.config.dhcpv4.vss.enabled {
+                                            Some(inner.config.dhcpv4.vss.clone())
+                                        } else {
+                                            None
+                                        };
+
                                         let mut pipeline = dhcp::v4::pipeline::Dhcpv4Pipeline::build_request(
                                             local_addrs,
                                             inner.config.dhcpv4.circuit_id.as_ref().map(|s| s.as_bytes().to_vec()),
                                             inner.config.dhcpv4.remote_id.as_ref().map(|s| s.as_bytes().to_vec()),
                                             iface_ip,
                                             inner.config.dhcpv4.server_addrs.first().copied().unwrap_or(bind_addr),
+                                            vss_cfg,
                                         );
 
                                         match pipeline.execute(&mut ctx) {
@@ -267,8 +274,15 @@ impl RelayAgent {
                                             iface_name.clone(),
                                         );
 
+                                        let vss_cfg = if inner.config.dhcpv4.vss.enabled {
+                                            Some(inner.config.dhcpv4.vss.clone())
+                                        } else {
+                                            None
+                                        };
+
                                         let mut pipeline = dhcp::v4::pipeline::Dhcpv4Pipeline::build_reply(
                                             expected_sub_opts,
+                                            vss_cfg,
                                         );
 
                                         match pipeline.execute(&mut ctx) {
@@ -358,8 +372,15 @@ impl RelayAgent {
                                         // Forward to the original client peer
                                         let client_addr = src; // reply goes back to client from recv interface
 
+                                        let vss_cfg = if inner.config.dhcpv6.vss.enabled {
+                                            Some(inner.config.dhcpv6.vss.clone())
+                                        } else {
+                                            None
+                                        };
+
                                         let mut pipeline = dhcp::v6::pipeline::Dhcpv6Pipeline::build_reply(
                                             client_addr,
+                                            vss_cfg,
                                         );
 
                                         match pipeline.execute(&mut ctx) {
@@ -412,12 +433,19 @@ impl RelayAgent {
                                             .copied()
                                             .unwrap_or(bind_addr);
 
+                                        let vss_cfg = if inner.config.dhcpv6.vss.enabled {
+                                            Some(inner.config.dhcpv6.vss.clone())
+                                        } else {
+                                            None
+                                        };
+
                                         let mut pipeline = dhcp::v6::pipeline::Dhcpv6Pipeline::build_request(
                                             iface_name.clone(),
                                             inner.config.dhcpv6.remote_id.clone().unwrap_or_default(),
                                             link_addr,
                                             src,
                                             server_addr,
+                                            vss_cfg,
                                         );
 
                                         match pipeline.execute(&mut ctx) {

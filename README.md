@@ -57,47 +57,62 @@ cargo run --example simple_relay
 
 ```
 Public API Layer     RelayAgent, RelayConfig, RelayEvent, RelayStats
-Service Layer        Dhcpv4Pipeline, Dhcpv6Pipeline, SmfEngine
+Pipeline Layer       dhcp/v4/pipeline, dhcp/v6/pipeline, SmfEngine
 Protocol Layer       dhcp/v4/*, dhcp/v6/*, smf/*
-Transport Layer      UdpTransport (tokio async UDP)
+Transport Layer      Transport trait + UdpTransport adapter (tokio async UDP)
 ```
 
 Every DHCP message flows through an ordered **pipeline** of `PipelineStage` trait objects.
 Each stage's `process(&mut PipelineContext) -> Result<bool, RelayError>` returns `Ok(false)`
 to drop the packet or `Ok(true)` to continue to the next stage. `PipelineContext` carries the
-raw buffer, source/destination addresses, interface name, and a metadata bag for inter-stage
+working buffer, source/destination addresses, interface name, and a metadata bag for inter-stage
 communication.
 
 ### DHCPv4 Client→Server Pipeline
+
 ```
-Parse → Validate → Option82 (insert) → VSS (insert) → Giaddr (set) → Forward
+Parse → Validate → [Option82 insert] → [VSS insert] → Giaddr (set) → Forward
 ```
 
+Stages in brackets are conditional — controlled by `enable_option82` and `vss.enabled` config flags.
+When disabled, basic relay (giaddr + forward) still works.
+
 ### DHCPv4 Server→Client Pipeline
+
 ```
-Parse → Validate (echo check) → VSS (check removal) → Option82 (strip) → Forward
+Parse → [VSS check] → [Option82 strip+echo] → ReplyAddr → Forward
 ```
 
 ### DHCPv6 Client→Server Pipeline
+
 ```
-Parse → Validate → Interface-ID (insert) → Remote-ID (insert) → VSS (insert) → Encapsulate in RELAY_FORW → Forward
+Parse → [Interface-ID] → [Remote-ID] → [VSS insert] → RelayFwd (encapsulate) → Forward
 ```
 
+Interface-ID and Remote-ID stages are controlled independently by `enable_interface_id` and
+`enable_remote_id` flags. VSS is conditional on `vss.enabled`.
+
 ### DHCPv6 Server→Client Pipeline
+
 ```
-Decapsulate RELAY_REPL → Validate → VSS (check removal) → Remote-ID (check) → Interface-ID (check) → Forward
+Parse → [VSS extract] → RelayReply (decapsulate) → InterfaceIdExtract → Forward
 ```
 
 ### SMF Forwarding Engine
+
 ```
-Recv → DPD (duplicate detection) → 7 forwarding rules → DPD insert → Send
+Recv → 7 forwarding rules → Relay set selection → DPD check → TTL decrement → Send
 ```
+
+The `SmfEngine` integrates DPD duplicate detection, forwarding rule checks, and relay set
+selection behind a single `process_packet()` entry point.
 
 ## Configuration
 
 ```rust
 use dhcp_relay_agent::config::{
-    RelayConfig, InterfaceConfig, Dhcpv4Config, Dhcpv6Config, VssConfig, SmfConfig,
+    RelayConfig, InterfaceConfig, Dhcpv4Config, Dhcpv6Config,
+    VssConfig, SmfConfig, DpdMode, HashFunction,
 };
 
 let config = RelayConfig {
@@ -112,6 +127,12 @@ let config = RelayConfig {
         enable_option82: true,
         circuit_id: Some("rack-3-slot-7".into()),
         remote_id: None,      // defaults to relay IP
+        vss: VssConfig {
+            enabled: false,
+            vss_type: 0,
+            vss_info: b"vpn-sales".to_vec(),
+            vpn_name: Some("sales".into()),
+        },
     },
     dhcpv6: Dhcpv6Config {
         server_addrs: vec!["[2001:db8::1]:547".parse().unwrap()],
@@ -122,14 +143,26 @@ let config = RelayConfig {
     smf: SmfConfig {
         enabled: false,
         dpd_window_secs: 10,
-        dpd_mode: "i-dpd".into(),   // or "h-dpd"
-        hash_function: "murmur3".into(),
+        dpd_mode: DpdMode::IDpd,
+        hash_function: HashFunction::Murmur3,
     },
     max_packet_size: 1500,
 };
 ```
 
 Configuration supports serde serialization/deserialization (JSON, YAML, etc.).
+`DpdMode` serializes as `"i-dpd"` / `"h-dpd"`; `HashFunction` as `"murmur3"`.
+
+### VSS Configuration (RFC 6607)
+
+`VssConfig` is shared between DHCPv4 and DHCPv6. Validation is centralized in
+`VssConfig::validate_vss()` and runs at `RelayAgent::new()` time (fail-fast):
+
+| `vss_type` | Description | `vss_info` constraint |
+|-----------|-------------|----------------------|
+| 0 | NVT ASCII VPN name | Any length |
+| 1 | RFC 2685 VPN-ID | Exactly 7 bytes (3-byte OUI + 4-byte index) |
+| 255 | Global / default | Must be empty |
 
 ## API Overview
 
@@ -146,6 +179,10 @@ Configuration supports serde serialization/deserialization (JSON, YAML, etc.).
 
 ### `RelayStats`
 
+All counters are `AtomicU64` fields on `RelayStats`. `RelayStatsSnapshot` (obtained via
+`stats()`) is a serializable snapshot with plain `u64` values. Counters are declared via
+the `define_stats!` macro — adding a new counter requires only one line.
+
 | Counter | Description |
 |---------|-------------|
 | `packets_received` | Total packets received |
@@ -158,10 +195,17 @@ Configuration supports serde serialization/deserialization (JSON, YAML, etc.).
 | `smf_duplicates_detected` | SMF duplicate packets detected |
 | `smf_forwarded` | SMF packets forwarded |
 
+### `Transport` trait
+
+The `Transport` trait provides a seam for the UDP layer — `UdpTransport` is the default
+adapter backed by `tokio::UdpSocket`. Handler functions accept `&impl Transport`, allowing
+mock transports for testing without binding real sockets.
+
 ### Extensibility Traits (SMF)
 
 - **`TopologyProvider`** — supplies 1-hop and 2-hop neighbor discovery for relay set selection
 - **`RelaySetSelector`** — decides whether to forward a multicast packet out a given interface
+- **`ClassicFlooding`** — built-in relay set selector (always forward)
 
 ## Security Invariants
 
@@ -170,6 +214,43 @@ Configuration supports serde serialization/deserialization (JSON, YAML, etc.).
 - Server replies must echo Option 82 exactly — mismatch causes drop
 - Reforwarded packets (giaddr != 0) never get Option 82 added
 - DPD TTL-based DoS protection: larger TTL accepted (pre-play countermeasure), smaller TTL rejected
+- Client→server message types (Discover, Request, Inform, Decline, Release) are classified
+  correctly; server→client types are routed to the reply pipeline with echo validation
+
+## Module Map
+
+```
+src/
+├── lib.rs              RelayAgent, RelayEvent, RelayStats, handler functions, spawn tasks
+├── config.rs           RelayConfig, InterfaceConfig, Dhcpv4Config, Dhcpv6Config,
+│                       VssConfig (with validate_vss), SmfConfig, DpdMode, HashFunction
+├── error.rs            RelayError enum, RelayResult type alias
+├── pipeline.rs         Pipeline, PipelineStage trait, PipelineContext (with modify_v4/v6)
+├── traits.rs           TopologyProvider, RelaySetSelector traits
+├── transport/
+│   ├── mod.rs          Transport trait (async_trait)
+│   └── udp.rs          UdpTransport adapter
+├── dhcp/
+│   ├── v4/
+│   │   ├── pipeline.rs build_request, build_reply, all v4 stage implementations
+│   │   ├── option82.rs SubOption type, insert, strip, validate_echo
+│   │   ├── giaddr.rs   GiaddrDecision enum, validate
+│   │   └── vss.rs      VSS sub-option encoding, server support check
+│   └── v6/
+│       ├── pipeline.rs build_request, build_reply, all v6 stage implementations
+│       ├── relay_fwd.rs RelayFwdCodec (encapsulate/decapsulate), RELAY_FORW/RELAY_REPL
+│       ├── interface_id.rs encode/decode Interface-ID option (18)
+│       ├── remote_id.rs    encode/decode Remote-ID option (37)
+│       └── vss.rs      VSS option (68) encode/extract
+└── smf/
+    ├── engine.rs       SmfEngine (process_packet entry point, decrement_ttl helper)
+    ├── dpd.rs          DpdCache, DpdKey, h_dpd_hash, spawn_eviction_task
+    ├── dpd_ipv4.rs     i_dpd_packet_id, h_dpd_packet_id (thin wrapper)
+    ├── dpd_ipv6.rs     i_dpd_packet_id_from_option, h_dpd_packet_id (thin wrapper)
+    ├── dpd_option.rs   SmfDpdOption encode/decode
+    ├── forwarding.rs   check_forwarding_rules (7 rules from RFC 6621 §5)
+    └── relay_set.rs    ClassicFlooding relay set selector
+```
 
 ## Development
 
@@ -177,7 +258,7 @@ Configuration supports serde serialization/deserialization (JSON, YAML, etc.).
 cargo build                           # default features (dhcpv4)
 cargo build --features full           # all features
 cargo test                            # default features
-cargo test --features full            # all features (114 tests)
+cargo test --features full            # all features (118 tests)
 cargo clippy -- -D warnings           # zero-warning policy
 cargo doc --no-deps                   # must produce zero warnings
 ```
